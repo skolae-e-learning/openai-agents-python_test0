@@ -769,9 +769,19 @@ def build_plan(conn, project, cycle, team) -> None:
 
 
 def produce(project, cycle, agent, step, upstream, memory) -> tuple[str, str, dict]:
-    if LIVE:
+    """Produit la contribution d'un agent, en réel si possible, sinon en démo.
+
+    Une clé présente mais un SDK absent ne doit pas faire échouer le cycle : on
+    retombe sur le déroulé de démonstration en le disant explicitement.
+    """
+    if not LIVE:
+        return produce_demo(project, cycle, agent, step, upstream, memory)
+    try:
         return produce_live(project, cycle, agent, step, upstream, memory)
-    return produce_demo(project, cycle, agent, step, upstream, memory)
+    except ImportError:
+        title, text, data = produce_demo(project, cycle, agent, step, upstream, memory)
+        data["sdk_missing"] = True
+        return title, text + "\n\n(SDK openai-agents absent du déploiement : contenu de démonstration.)", data
 
 
 def _context(project, cycle, step, upstream, memory) -> str:
