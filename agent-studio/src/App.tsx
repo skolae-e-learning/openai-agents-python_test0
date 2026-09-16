@@ -60,12 +60,48 @@ export default function App() {
       </nav>
 
       <main className="main" key={nonce}>
-        {view.name === "agents" && <Agents onChanged={() => setNonce((n) => n + 1)} />}
-        {view.name === "projects" && <Projects onOpen={(id) => setView({ name: "project", id })} />}
-        {view.name === "project" && (
+        {status && !status.db && <Setup detail={status.db_detail} />}
+        {status?.db && view.name === "agents" && <Agents onChanged={() => setNonce((n) => n + 1)} />}
+        {status?.db && view.name === "projects" && <Projects onOpen={(id) => setView({ name: "project", id })} />}
+        {status?.db && view.name === "project" && (
           <ProjectView id={view.id} live={!!status?.live} onBack={() => setView({ name: "projects" })} />
         )}
       </main>
     </div>
+  );
+}
+
+function Setup({ detail }: { detail: string }) {
+  return (
+    <>
+      <div className="head">
+        <div>
+          <h1>Configuration requise</h1>
+          <p>L'application est déployée, mais elle n'a pas encore accès à sa base de données.</p>
+        </div>
+      </div>
+      <div className="body">
+        <div className="card" style={{ maxWidth: 760 }}>
+          <div className="card-h">Une variable d'environnement à ajouter</div>
+          <div className="card-b" style={{ display: "grid", gap: 14 }}>
+            <p style={{ margin: 0, color: "var(--ink-2)" }}>
+              Dans les réglages du projet Vercel, section <b>Environment Variables</b>, ajoutez une variable
+              nommée <code>DATABASE_URL</code> dont la valeur est la chaîne de connexion du projet Neon
+              nommé <b>agent-studio</b>. Elle se copie depuis la console Neon. Redéployez ensuite : le schéma
+              est déjà créé, l'application se connectera directement.
+            </p>
+            <p style={{ margin: 0, color: "var(--ink-2)" }}>
+              Une seconde variable, <code>OPENAI_API_KEY</code>, est facultative. Sans elle, l'application
+              fonctionne en mode démo : le parcours des agents, les écritures en base, la boucle de révision
+              et la suspension pour validation humaine sont réels, seul le texte produit est fabriqué
+              localement. Avec elle, les agents sont exécutés par le SDK <code>openai-agents</code>.
+            </p>
+            <div className="banner warn" style={{ display: "block" }}>
+              <b>Réponse de l'API :</b> {detail}
+            </div>
+          </div>
+        </div>
+      </div>
+    </>
   );
 }

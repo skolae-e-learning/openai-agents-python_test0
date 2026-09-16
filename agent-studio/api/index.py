@@ -512,6 +512,18 @@ def control(project_id: str, body: ControlIn):
 
 
 def enqueue(conn, project_id, cycle_id):
+    """Planifie le step suivant.
+
+    Idempotent : un cycle n'a jamais deux steps en attente. C'est ce qui permet
+    de reprendre après une pause sans exécuter deux fois le même step.
+    """
+    pending = q1(
+        conn,
+        "select id from jobs where cycle_id=%s and status in ('queued','running') limit 1",
+        cycle_id,
+    )
+    if pending:
+        return
     q(
         conn,
         "insert into jobs (project_id, cycle_id, kind) values (%s,%s,'run_step')",
