@@ -16,7 +16,12 @@ const ROLES: [string, string, string][] = [
 // chaque sauvegarde, et ne doit pas rouvrir la création pour autant.
 let consumedAutoOpen = 0;
 
-export function Agents({ onChanged, autoOpenCreate }: { onChanged: () => void; autoOpenCreate?: number }) {
+export function Agents({ onChanged, autoOpenCreate, onLoadDemo, seeding }: {
+  onChanged: () => void;
+  autoOpenCreate?: number;
+  onLoadDemo: () => void;
+  seeding: boolean;
+}) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [draft, setDraft] = useState<Partial<Agent> | null>(null);
   const [memory, setMemory] = useState<{ id: string; content: string }[]>([]);
@@ -81,11 +86,27 @@ export function Agents({ onChanged, autoOpenCreate }: { onChanged: () => void; a
 
       <div className="body">
         {agents.length === 0 ? (
-          <div className="card"><div className="empty">Aucun agent pour l'instant. Créez-en un, ou amorcez une équipe depuis l'accueil.</div></div>
+          <div className="card"><div className="empty">
+            <div style={{ display: "grid", gap: 14, justifyItems: "center" }}>
+              <div>Aucun agent pour l'instant.</div>
+              <button className="btn primary" onClick={() => open()}>Créer mon premier agent</button>
+              <div className="small" style={{ maxWidth: "52ch", lineHeight: 1.6 }}>
+                L'exemple de démonstration crée d'un coup une équipe toute faite de 5 agents
+                et un projet qui les relie, pour voir le fonctionnement sans rien écrire.
+                <div style={{ marginTop: 9 }}>
+                  <button className="btn sm" disabled={seeding} onClick={onLoadDemo}>
+                    {seeding ? "chargement…" : "Charger l'exemple de démonstration"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div></div>
         ) : (
           <div className="grid">
             {agents.map((a) => (
-              <div className="card agent" key={a.id}>
+              <div className="card agent clickable" key={a.id} onClick={() => open(a)}
+                role="button" tabIndex={0}
+                onKeyDown={(e) => { if (e.key === "Enter") open(a); }}>
                 <h3>
                   <span className="dot" style={{ background: accentOf(a.accent) }} />
                   {a.name}
@@ -95,8 +116,8 @@ export function Agents({ onChanged, autoOpenCreate }: { onChanged: () => void; a
                   <span className="tag">{ROLES.find((r) => r[0] === a.role)?.[1] || a.role}</span>
                   <span className="tag">{a.model}</span>
                   <div style={{ flex: 1 }} />
-                  <button className="btn sm ghost" onClick={() => open(a)}>Modifier</button>
-                  <button className="btn sm ghost" onClick={() => remove(a)}>Supprimer</button>
+                  <button className="btn sm ghost danger"
+                    onClick={(e) => { e.stopPropagation(); remove(a); }}>Supprimer</button>
                 </div>
               </div>
             ))}

@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Agents } from "./Agents";
 import { Projects } from "./Projects";
 import { ProjectView } from "./ProjectView";
-import { api } from "./api";
+import { api, type Summary } from "./api";
 
 type View = { name: "agents" } | { name: "projects" } | { name: "project"; id: string };
 
@@ -13,9 +13,31 @@ export default function App() {
   const [nonce, setNonce] = useState(0);
   const [agentBoot, setAgentBoot] = useState(0);
 
+  const [summary, setSummary] = useState<Summary | null>(null);
+  const [installer, setInstaller] = useState<any>(null);
+
   const goCreateAgent = () => { setView({ name: "agents" }); setAgentBoot((n) => n + 1); };
 
   useEffect(() => { api.state().then(setStatus).catch(() => setStatus({ db: false, db_detail: "API injoignable", live: false })); }, []);
+
+  // Compteurs de la barre latérale : rafraîchis en continu, y compris pendant qu'un
+  // cycle tourne dans un autre onglet.
+  useEffect(() => {
+    let alive = true;
+    const pull = () => api.summary().then((s) => { if (alive) setSummary(s); }).catch(() => {});
+    pull();
+    const t = setInterval(pull, 10000);
+    return () => { alive = false; clearInterval(t); };
+  }, [nonce]);
+
+  // Chrome n'expose l'installation qu'à travers cet évènement : on le capture pour
+  // pouvoir proposer le bouton au bon moment plutôt qu'un bouton toujours inerte.
+  useEffect(() => {
+    const onPrompt = (e: Event) => { e.preventDefault(); setInstaller(e); };
+    window.addEventListener("beforeinstallprompt", onPrompt);
+    window.addEventListener("appinstalled", () => setInstaller(null));
+    return () => window.removeEventListener("beforeinstallprompt", onPrompt);
+  }, []);
 
   const seed = async () => {
     setSeeding(true);
@@ -41,7 +63,11 @@ export default function App() {
         </div>
 
         <button className={"navbtn" + (view.name !== "agents" ? " on" : "")} onClick={() => setView({ name: "projects" })}>
-          <span className="lbl-txt">Projets</span><span>◻</span>
+          <span className="lbl-txt">Projets</span>
+          <span className="counts lbl-txt">
+            {!!summary?.running && <span className="ct ok" title={`${summary.running} projet(s) en cours`}>▶ {summary.running}</span>}
+            {!!summary?.paused && <span className="ct warn" title={`${summary.paused} projet(s) en pause`}>⏸ {summary.paused}</span>}
+          </span>
         </button>
         <button className={"navbtn" + (view.name === "agents" ? " on" : "")} onClick={() => setView({ name: "agents" })}>
           <span className="lbl-txt">Agents</span><span>◇</span>
@@ -56,19 +82,24 @@ export default function App() {
             <span className="dot" style={{ background: status?.live ? "var(--ok)" : "var(--warn)" }} />
             <span className="lbl-txt">{status?.live ? "modèles actifs" : "mode démo"}</span>
           </div>
-          <button className="btn sm ghost lbl-txt" style={{ marginTop: 10, paddingLeft: 0 }} disabled={seeding} onClick={seed}>
-            {seeding ? "amorçage…" : "Amorcer une équipe"}
-          </button>
+          {installer && (
+            <button className="btn sm lbl-txt" style={{ marginTop: 10 }}
+              onClick={async () => { installer.prompt(); await installer.userChoice; setInstaller(null); }}>
+              Installer l'application
+            </button>
+          )}
         </div>
       </nav>
 
       <main className="main" key={nonce}>
         {status && !status.db && <Setup detail={status.db_detail} />}
         {status?.db && view.name === "agents" && (
-          <Agents onChanged={() => setNonce((n) => n + 1)} autoOpenCreate={agentBoot} />
+          <Agents onChanged={() => setNonce((n) => n + 1)} autoOpenCreate={agentBoot}
+            onLoadDemo={seed} seeding={seeding} />
         )}
         {status?.db && view.name === "projects" && (
-          <Projects onOpen={(id) => setView({ name: "project", id })} onCreateAgent={goCreateAgent} />
+          <Projects onOpen={(id) => setView({ name: "project", id })} onCreateAgent={goCreateAgent}
+            onLoadDemo={seed} seeding={seeding} />
         )}
         {status?.db && view.name === "project" && (
           <ProjectView id={view.id} live={!!status?.live} onBack={() => setView({ name: "projects" })} />

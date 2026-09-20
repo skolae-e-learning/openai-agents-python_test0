@@ -159,6 +159,23 @@ def state():
     return {"db": ok, "db_detail": detail, "live": LIVE, "mode": "live" if LIVE else "demo"}
 
 
+@app.get("/api/summary")
+def summary():
+    """Compteurs globaux affichés en permanence dans la barre latérale."""
+    with db() as conn:
+        row = q(
+            conn,
+            """select
+                 count(*) filter (where state='RUNNING') as running,
+                 count(*) filter (where state='PAUSED')  as paused
+               from projects""",
+        )[0]
+        pending = q(
+            conn, "select count(*) as n from decisions where status='pending'"
+        )[0]["n"]
+        return {"running": row["running"], "paused": row["paused"], "pending": pending}
+
+
 @app.get("/api/agents")
 def list_agents():
     with db() as conn:
@@ -638,7 +655,23 @@ def run_step(conn, job) -> str:
         return "skipped"
 
     if step.get("gate"):
-        detail = step.get("task", "")
+        # Le motif doit être lisible sans ouvrir le journal : qui bloque, sur quelle
+        # action, et ce qu'on attend de l'humain.
+        reason = {
+            "why": step.get(
+                "why",
+                "Cette action est irréversible : elle ne part pas sans votre accord.",
+            ),
+            "agent": agent["name"],
+            "action": step.get("label", "Validation requise"),
+            "step_index": cursor + 1,
+            "step_total": len(plan),
+            "produced": q(
+                conn,
+                "select count(*) as n from artifacts where cycle_id=%s",
+                cycle["id"],
+            )[0]["n"],
+        }
         q(
             conn,
             """insert into decisions (project_id, cycle_id, kind, title, detail, payload)
@@ -646,8 +679,8 @@ def run_step(conn, job) -> str:
             project["id"],
             cycle["id"],
             step.get("label", "Validation requise"),
-            detail,
-            json.dumps({"step": step}),
+            step.get("task", ""),
+            json.dumps({"step": step, "reason": reason}),
         )
         q(conn, "update cycles set status='waiting_human' where id=%s", cycle["id"])
         log(conn, project["id"], cycle["id"], kind="gate", agent=agent,
@@ -753,6 +786,8 @@ def build_plan(conn, project, cycle, team) -> None:
                 "kind": "publish",
                 "gate": True,
                 "task": "Publier les contenus retenus. Action irréversible : validation humaine requise.",
+                "why": "La publication est irréversible une fois partie. Le cycle s'arrête ici "
+                       "et attend votre accord ; rien n'est publié tant que vous n'avez pas tranché.",
             }
         )
 

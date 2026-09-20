@@ -16,7 +16,8 @@ export type Message = {
   id: number; agent_name: string; kind: string; depth: number;
   title: string; body: string; payload: any; created_at: string;
 };
-export type Decision = { id: string; title: string; detail: string; status: string };
+export type Decision = { id: string; title: string; detail: string; status: string; payload?: any };
+export type Summary = { running: number; paused: number; pending: number };
 export type Artifact = { id: string; agent_name: string; type: string; title: string; body: string };
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
@@ -30,6 +31,7 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   state: () => call<{ db: boolean; db_detail: string; live: boolean; mode: string }>("/api/state"),
+  summary: () => call<Summary>("/api/summary"),
   seed: () => call<any>("/api/seed", { method: "POST" }),
 
   agents: () => call<Agent[]>("/api/agents"),

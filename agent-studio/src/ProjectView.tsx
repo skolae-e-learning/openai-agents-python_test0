@@ -18,8 +18,13 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
   const [starting, setStarting] = useState(false);
   const [intervening, setIntervening] = useState(false);
   const [instruction, setInstruction] = useState("");
+  const [adding, setAdding] = useState(false);
+  const [allAgents, setAllAgents] = useState<Agent[]>([]);
+  const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
+  const [allFolded, setAllFolded] = useState(false);
   const after = useRef(0);
   const scroller = useRef<HTMLDivElement>(null);
+  const inbox = useRef<HTMLDivElement>(null);
 
   const reload = useCallback(async () => {
     const d = await api.project(id);
@@ -69,6 +74,19 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
   const waiting = cycle?.status === "waiting_human";
   const progress = cycle?.plan?.length ? `step ${Math.min(cycle.cursor + 1, cycle.plan.length)} / ${cycle.plan.length}` : "";
 
+  // Le bandeau doit dire pourquoi c'est bloqué sans qu'on ouvre le journal.
+  const pending = decisions[0];
+  const reason = (pending?.payload as any)?.reason;
+  const blockReason = waiting
+    ? (reason
+        ? `${reason.agent} demande votre accord avant « ${reason.action} ». ${reason.why}`
+        : pending?.detail || "Une action attend votre validation avant de se poursuivre.")
+    : paused
+      ? "Vous avez mis le cycle en pause. Le step en cours s'est terminé, aucun nouveau step n'est planifié. L'état est conservé : la reprise repartira exactement d'ici."
+      : cycle?.status === "failed"
+        ? "Un step a échoué. Le détail exact figure dans le journal, au dernier message système."
+        : cycle?.note || "Le cycle a été arrêté. Les contenus déjà produits sont conservés.";
+
   const start = async () => {
     setStarting(false);
     after.current = 0; setMessages([]);
@@ -93,6 +111,24 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
           kind: team.find((t) => t.id === target)?.team_role === "critic" ? "reviews" : "calls" } as Edge];
     setEdges(kept);
     await api.setEdges(id, kept.map((e) => ({ source: e.source_agent_id, target: e.target_agent_id, kind: e.kind })));
+  };
+
+  const toggleMsg = (msgId: number) => {
+    setCollapsed((s) => {
+      const next = new Set(s);
+      next.has(msgId) ? next.delete(msgId) : next.add(msgId);
+      return next;
+    });
+  };
+
+  const foldAll = () => {
+    if (allFolded) { setCollapsed(new Set()); setAllFolded(false); }
+    else { setCollapsed(new Set(messages.map((m) => m.id))); setAllFolded(true); }
+  };
+
+  const openAdd = async () => {
+    setAllAgents(await api.agents());
+    setAdding(true);
   };
 
   const addSuggested = async (a: Agent) => {
@@ -129,6 +165,35 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
       </div>
 
       <div className="body">
+        {(waiting || paused || cycle?.status === "failed" || cycle?.status === "stopped") && (
+          <div className={"alert" + (cycle?.status === "failed" || cycle?.status === "stopped" ? " stopped" : "")}>
+            <span className="ic">{waiting ? "⏸" : paused ? "⏸" : "⛔"}</span>
+            <div style={{ flex: 1, minWidth: 220 }}>
+              <h4>
+                {waiting ? "Cycle suspendu — votre arbitrage est nécessaire"
+                  : paused ? "Cycle en pause"
+                  : cycle?.status === "failed" ? "Cycle interrompu par une erreur"
+                  : "Cycle arrêté"}
+              </h4>
+              <p>{blockReason}</p>
+              {cycle?.plan?.length ? (
+                <div className="meta">
+                  <span className="tag">step {Math.min(cycle.cursor + 1, cycle.plan.length)} / {cycle.plan.length}</span>
+                  <span className="tag">{artifacts.length} production{artifacts.length > 1 ? "s" : ""} conservée{artifacts.length > 1 ? "s" : ""}</span>
+                </div>
+              ) : null}
+            </div>
+            <div className="row">
+              {waiting && decisions.length > 0 && (
+                <button className="btn primary" onClick={() => inbox.current?.scrollIntoView({ behavior: "smooth", block: "center" })}>
+                  Arbitrer maintenant
+                </button>
+              )}
+              {paused && <button className="btn primary" onClick={() => control("resume")}>▶ Reprendre</button>}
+            </div>
+          </div>
+        )}
+
         {!live && (
           <div className="banner warn" style={{ marginBottom: 16 }}>
             <b>Mode démo.</b>
@@ -139,7 +204,11 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
         <div className="cols">
           <div style={{ display: "grid", gap: 18 }}>
             <div className="card">
-              <div className="card-h">Architecture — qui parle à qui</div>
+              <div className="card-h">
+                Architecture — qui parle à qui
+                <div style={{ flex: 1 }} />
+                <button className="btn sm" onClick={openAdd}>+ Ajouter un agent</button>
+              </div>
               <div className="card-b">
                 <Canvas team={team} edges={edges} onMove={moveNode} onToggleEdge={toggleEdge} />
               </div>
@@ -171,9 +240,14 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
                 <div className="card-h">À arbitrer · {decisions.length}</div>
                 <div className="card-b">
                   {decisions.map((d) => (
-                    <div className="decision" key={d.id}>
+                    <div className="decision" key={d.id} ref={d.id === decisions[0].id ? inbox : undefined}>
                       <h4>{d.title}</h4>
                       <div className="small" style={{ color: "var(--ink-2)" }}>{d.detail}</div>
+                      {(d.payload as any)?.reason?.why && (
+                        <div className="small" style={{ color: "var(--ink-2)", marginTop: 6 }}>
+                          <b>Pourquoi c'est bloqué :</b> {(d.payload as any).reason.why}
+                        </div>
+                      )}
                       <div className="row" style={{ marginTop: 10 }}>
                         <button className="btn sm primary" onClick={async () => { await api.respond(d.id, "approved"); reload(); }}>Autoriser</button>
                         <button className="btn sm" onClick={async () => { await api.respond(d.id, "rejected"); reload(); }}>Rejeter</button>
@@ -188,20 +262,41 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
               <div className="card-h" style={{ gap: 4 }}>
                 <button className={"btn sm ghost" + (tab === "journal" ? " " : "")} style={{ color: tab === "journal" ? "var(--accent)" : undefined }} onClick={() => setTab("journal")}>Journal</button>
                 <button className="btn sm ghost" style={{ color: tab === "artifacts" ? "var(--accent)" : undefined }} onClick={() => setTab("artifacts")}>Productions · {artifacts.length}</button>
+                <div style={{ flex: 1 }} />
+                {tab === "journal" && messages.length > 0 && (
+                  <button className="btn sm ghost" onClick={foldAll}>
+                    {allFolded ? "Tout déplier" : "Tout replier"}
+                  </button>
+                )}
               </div>
               {tab === "journal" ? (
                 <div className="journal" ref={scroller}>
                   {messages.length === 0
                     ? <div className="empty">Le journal est vide. Lancez un cycle pour voir les agents travailler.</div>
-                    : messages.map((m) => (
-                      <div key={m.id} className={`msg d${Math.min(m.depth, 2)} k-${m.kind}`}>
-                        <div className="t">
-                          {m.agent_name && <span className="dot" style={{ background: accentOf(team.find((t) => t.name === m.agent_name)?.accent) }} />}
-                          {m.title}
+                    : messages.map((m) => {
+                      const long = (m.body || "").length > 200;
+                      const shut = collapsed.has(m.id);
+                      return (
+                        <div key={m.id} className={`msg d${Math.min(m.depth, 2)} k-${m.kind}`}>
+                          {long ? (
+                            <button className="head-row" onClick={() => toggleMsg(m.id)}
+                              aria-expanded={!shut}>
+                              <span className={"chev" + (shut ? "" : " open")}>▶</span>
+                              <span className="t" style={{ flex: 1 }}>
+                                {m.agent_name && <span className="dot" style={{ background: accentOf(team.find((t) => t.name === m.agent_name)?.accent) }} />}
+                                {m.title}
+                              </span>
+                            </button>
+                          ) : (
+                            <div className="t">
+                              {m.agent_name && <span className="dot" style={{ background: accentOf(team.find((t) => t.name === m.agent_name)?.accent) }} />}
+                              {m.title}
+                            </div>
+                          )}
+                          {m.body && <div className={"b" + (long && shut ? " clamped" : "")}>{m.body}</div>}
                         </div>
-                        {m.body && <div className="b">{m.body}</div>}
-                      </div>
-                    ))}
+                      );
+                    })}
                 </div>
               ) : (
                 <div className="journal">
@@ -209,9 +304,21 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
                     ? <div className="empty">Aucune production pour l'instant.</div>
                     : artifacts.map((a) => (
                       <div className="art" key={a.id}>
-                        <h4>{a.title}</h4>
-                        <div className="small muted" style={{ marginBottom: 5 }}>{a.agent_name} · {a.type}</div>
-                        <div className="bd">{a.body}</div>
+                        <div className="art-meta">
+                          <h4>{a.type}</h4>
+                          <span className="who">
+                            <span className="dot" style={{ background: accentOf(team.find((t) => t.name === a.agent_name)?.accent), marginRight: 5 }} />
+                            {a.agent_name}
+                          </span>
+                          <span className="who">· {a.title}</span>
+                        </div>
+                        <div className="art-body">{a.body}</div>
+                        <div className="art-actions">
+                          <button className="btn sm ghost"
+                            onClick={() => navigator.clipboard?.writeText(a.body)}>
+                            Copier la production
+                          </button>
+                        </div>
                       </div>
                     ))}
                 </div>
@@ -239,6 +346,35 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
             <div className="modal-f">
               <button className="btn ghost" onClick={() => setStarting(false)}>Annuler</button>
               <button className="btn primary" onClick={start}>Lancer</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {adding && (
+        <div className="modal-bg" onMouseDown={(e) => e.target === e.currentTarget && setAdding(false)}>
+          <div className="modal">
+            <div className="modal-h">Ajouter un agent au projet</div>
+            <div className="modal-b">
+              {allAgents.filter((a) => !team.some((t) => t.id === a.id)).length === 0 ? (
+                <div className="empty">Tous vos agents font déjà partie de cette équipe.</div>
+              ) : (
+                allAgents.filter((a) => !team.some((t) => t.id === a.id)).map((a) => (
+                  <div key={a.id} className="row" style={{ padding: "8px 0", borderBottom: "1px solid var(--line-soft)" }}>
+                    <span className="dot" style={{ background: accentOf(a.accent) }} />
+                    <span style={{ flex: 1, minWidth: 0 }}>
+                      <b style={{ fontWeight: 600 }}>{a.name}</b>
+                      <span className="small muted" style={{ display: "block" }}>{a.description}</span>
+                    </span>
+                    <span className="tag">{a.role === "orchestrator" ? "chef" : a.role === "critic" ? "critique" : "spécialiste"}</span>
+                    <button className="btn sm primary"
+                      onClick={async () => { await addSuggested(a); setAdding(false); }}>Ajouter</button>
+                  </div>
+                ))
+              )}
+            </div>
+            <div className="modal-f">
+              <button className="btn ghost" onClick={() => setAdding(false)}>Fermer</button>
             </div>
           </div>
         </div>

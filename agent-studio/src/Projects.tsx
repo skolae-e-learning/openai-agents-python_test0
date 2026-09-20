@@ -1,7 +1,12 @@
 import { useEffect, useState } from "react";
 import { accentOf, api, type Agent, type Project } from "./api";
 
-export function Projects({ onOpen, onCreateAgent }: { onOpen: (id: string) => void; onCreateAgent: () => void }) {
+export function Projects({ onOpen, onCreateAgent, onLoadDemo, seeding }: {
+  onOpen: (id: string) => void;
+  onCreateAgent: () => void;
+  onLoadDemo: () => void;
+  seeding: boolean;
+}) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [creating, setCreating] = useState(false);
@@ -67,16 +72,29 @@ export function Projects({ onOpen, onCreateAgent }: { onOpen: (id: string) => vo
         {projects.length === 0 ? (
           <div className="card"><div className="empty">
             {agents.length === 0 ? (
-              <>
-                Aucun agent pour l'instant.{" "}
-                <button className="btn sm primary" onClick={onCreateAgent}>Créer mon premier agent</button>
-              </>
+              <div style={{ display: "grid", gap: 14, justifyItems: "center" }}>
+                <div>Aucun agent pour l'instant. Un projet a besoin d'agents pour fonctionner.</div>
+                <button className="btn primary" onClick={onCreateAgent}>Créer mon premier agent</button>
+                <div className="small" style={{ maxWidth: "52ch", lineHeight: 1.6 }}>
+                  Vous préférez voir le fonctionnement avant de créer quoi que ce soit ?
+                  L'exemple de démonstration crée d'un coup une équipe toute faite de 5 agents
+                  (chef d'orchestre, veille, stratège, rédacteur, critique) et un projet qui les
+                  relie, prêt à lancer un cycle.
+                  <div style={{ marginTop: 9 }}>
+                    <button className="btn sm" disabled={seeding} onClick={onLoadDemo}>
+                      {seeding ? "chargement…" : "Charger l'exemple de démonstration"}
+                    </button>
+                  </div>
+                </div>
+              </div>
             ) : "Aucun projet. Créez-en un et choisissez son équipe."}
           </div></div>
         ) : (
           <div className="grid">
             {projects.map((p) => (
-              <div className="card agent" key={p.id}>
+              <div className="card agent clickable" key={p.id} onClick={() => onOpen(p.id)}
+                role="button" tabIndex={0}
+                onKeyDown={(e) => { if (e.key === "Enter") onOpen(p.id); }}>
                 <h3>{p.name}</h3>
                 <p>{p.objective || <span className="muted">Pas d'objectif défini.</span>}</p>
                 <div className="foot">
@@ -86,8 +104,8 @@ export function Projects({ onOpen, onCreateAgent }: { onOpen: (id: string) => vo
                   <span className="tag">{p.team_size} agents</span>
                   {!!p.pending_count && <span className="tag warn">{p.pending_count} à arbitrer</span>}
                   <div style={{ flex: 1 }} />
-                  <button className="btn sm ghost" onClick={() => remove(p)}>Supprimer</button>
-                  <button className="btn sm" onClick={() => onOpen(p.id)}>Ouvrir</button>
+                  <button className="btn sm ghost danger"
+                    onClick={(e) => { e.stopPropagation(); remove(p); }}>Supprimer</button>
                 </div>
               </div>
             ))}
