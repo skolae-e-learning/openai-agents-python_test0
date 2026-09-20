@@ -102,6 +102,7 @@ export function Projects({ onOpen, onCreateAgent, onLoadDemo, seeding }: {
                     {p.state === "RUNNING" ? "en cours" : p.state === "PAUSED" ? "en pause" : "au repos"}
                   </span>
                   <span className="tag">{p.team_size} agents</span>
+                  {p.visibility === "public" && <span className="tag on">public</span>}
                   {!!p.pending_count && <span className="tag warn">{p.pending_count} à arbitrer</span>}
                   <div style={{ flex: 1 }} />
                   <button className="btn sm ghost danger"

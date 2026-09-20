@@ -3,6 +3,8 @@ create extension if not exists pgcrypto;
 
 create table if not exists agents (
   id           uuid primary key default gen_random_uuid(),
+  owner_id     text,                                  -- identifiant Neon Auth ; null = créé avant les comptes
+  visibility   text not null default 'private',       -- 'private' | 'public'
   name         text not null,
   description  text not null default '',
   role         text not null default 'specialist',
@@ -24,6 +26,8 @@ create table if not exists agent_memory (
 
 create table if not exists projects (
   id            uuid primary key default gen_random_uuid(),
+  owner_id      text,                                 -- identifiant Neon Auth ; null = créé avant les comptes
+  visibility    text not null default 'private',      -- 'private' | 'public'
   name          text not null,
   objective     text not null default '',
   state         text not null default 'IDLE',
@@ -132,6 +136,10 @@ create table if not exists facts (
   created_at timestamptz not null default now()
 );
 
+create index if not exists agents_owner_idx      on agents (owner_id);
+create index if not exists agents_visibility_idx on agents (visibility) where visibility = 'public';
+create index if not exists projects_owner_idx    on projects (owner_id);
+create index if not exists projects_vis_idx      on projects (visibility) where visibility = 'public';
 create index if not exists messages_stream_idx  on messages (project_id, id);
 create index if not exists messages_cycle_idx   on messages (cycle_id, id);
 create index if not exists jobs_queue_idx       on jobs (status, run_after);

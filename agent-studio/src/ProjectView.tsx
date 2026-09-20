@@ -150,6 +150,19 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
             </span>
             {progress && <span className="tag">{progress}</span>}
             {cycle?.demo && <span className="tag">mode démo</span>}
+            <button className={"tag " + (project.visibility === "public" ? "on" : "")}
+              style={{ cursor: "pointer", background: "none" }}
+              title="Un projet public est visible dans Explorer et duplicable par d'autres comptes."
+              onClick={async () => {
+                await api.updateProject(id, {
+                  name: project.name, objective: project.objective,
+                  max_revisions: project.max_revisions,
+                  visibility: project.visibility === "public" ? "private" : "public",
+                });
+                reload();
+              }}>
+              {project.visibility === "public" ? "public" : "privé"}
+            </button>
           </div>
           <h1 style={{ marginTop: 7 }}>{project.name}</h1>
           <p>{project.objective}</p>

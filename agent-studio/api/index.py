@@ -16,8 +16,10 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
 
+import jwt
 import psycopg
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException
+from jwt import PyJWKClient
 from psycopg.rows import dict_row
 from pydantic import BaseModel
 
@@ -28,7 +30,108 @@ DATABASE_URL = os.environ.get("DATABASE_URL") or _FALLBACK_DSN
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 LIVE = bool(OPENAI_API_KEY)
 
+# Neon Auth (Stack Auth). Ces deux valeurs sont publiques par conception : la clé
+# publiable est faite pour vivre dans le navigateur. Le secret de signature, lui,
+# ne quitte jamais Stack : on ne fait que vérifier des signatures via JWKS.
+STACK_PROJECT_ID = os.environ.get("STACK_PROJECT_ID", "")
+STACK_PUBLISHABLE_CLIENT_KEY = os.environ.get("STACK_PUBLISHABLE_CLIENT_KEY", "")
+JWKS_URL = (
+    f"https://api.stack-auth.com/api/v1/projects/{STACK_PROJECT_ID}/.well-known/jwks.json"
+)
+AUTH_READY = bool(STACK_PROJECT_ID)
+
 app = FastAPI(title="Agent Studio")
+
+
+# --------------------------------------------------------------------------
+# Authentification
+# --------------------------------------------------------------------------
+
+_jwk_client: PyJWKClient | None = None
+
+
+def _jwks() -> PyJWKClient:
+    """Client JWKS mémorisé pour la durée de vie du processus serverless."""
+    global _jwk_client
+    if _jwk_client is None:
+        _jwk_client = PyJWKClient(JWKS_URL, cache_keys=True, lifespan=3600)
+    return _jwk_client
+
+
+def optional_user(authorization: str | None = Header(default=None)) -> dict | None:
+    """Identité si un jeton valide est présent, sinon None. Ne lève jamais."""
+    if not AUTH_READY or not authorization:
+        return None
+    parts = authorization.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+    try:
+        claims = jwt.decode(
+            parts[1],
+            _jwks().get_signing_key_from_jwt(parts[1]).key,
+            algorithms=["ES256"],
+            audience=STACK_PROJECT_ID,
+        )
+    except Exception:
+        return None
+    if not claims.get("sub"):
+        return None
+    return {"id": claims["sub"], "email": claims.get("email") or ""}
+
+
+def current_user(me: dict | None = Depends(optional_user)) -> dict:
+    """Identité obligatoire : toute route de données passe par là."""
+    if me is None:
+        raise HTTPException(401, "Connexion requise.")
+    return me
+
+
+# --------------------------------------------------------------------------
+# Contrôle d'accès
+#
+# Règle unique : on lit ce qui nous appartient ou ce qui est public, on ne
+# modifie que ce qui nous appartient. Les lignes créées avant l'arrivée des
+# comptes ont owner_id nul : lisibles par tous, modifiables par personne tant
+# qu'un compte ne les a pas réclamées.
+# --------------------------------------------------------------------------
+
+LEGACY_HINT = (
+    "Cet élément a été créé avant la mise en place des comptes. "
+    "Récupérez-le depuis l'écran Agents pour pouvoir le modifier."
+)
+
+
+def _fetch(conn, table: str, row_id: str) -> dict:
+    row = q1(conn, f"select * from {table} where id=%s", row_id)
+    if not row:
+        raise HTTPException(404, "Élément introuvable.")
+    return row
+
+
+def readable(conn, table: str, row_id: str, me: dict) -> dict:
+    row = _fetch(conn, table, row_id)
+    if row["owner_id"] in (None, me["id"]) or row["visibility"] == "public":
+        return row
+    raise HTTPException(404, "Élément introuvable.")
+
+
+def owned(conn, table: str, row_id: str, me: dict) -> dict:
+    row = _fetch(conn, table, row_id)
+    if row["owner_id"] == me["id"]:
+        return row
+    if row["owner_id"] is None:
+        raise HTTPException(403, LEGACY_HINT)
+    raise HTTPException(403, "Cet élément appartient à quelqu'un d'autre.")
+
+
+# Les écrans « Agents » et « Projets » montrent ce qui m'appartient et ce qui
+# précède les comptes — pas le public des autres, qui a son propre écran.
+MINE = "(owner_id = %s or owner_id is null)"
+
+
+def _vis(value: str) -> str:
+    """Une visibilité inconnue retombe sur « privé » : le défaut sûr."""
+    return "public" if value == "public" else "private"
 
 
 # --------------------------------------------------------------------------
@@ -81,12 +184,14 @@ class AgentIn(BaseModel):
     model: str = "gpt-4.1-mini"
     temperature: float | None = None
     accent: str = "slate"
+    visibility: str = "private"
 
 
 class ProjectIn(BaseModel):
     name: str
     objective: str = ""
     max_revisions: int = 2
+    visibility: str = "private"
 
 
 class TeamMember(BaseModel):
@@ -156,39 +261,59 @@ def state():
             q1(conn, "select 1 as ok")
     except Exception as exc:  # pragma: no cover - dépend de l'infra
         ok, detail = False, str(exc)[:200]
-    return {"db": ok, "db_detail": detail, "live": LIVE, "mode": "live" if LIVE else "demo"}
+    return {
+        "db": ok,
+        "db_detail": detail,
+        "live": LIVE,
+        "mode": "live" if LIVE else "demo",
+        # Servie à l'exécution plutôt que figée au build : changer de projet Auth
+        # ne demande pas de reconstruire le front.
+        "auth": {
+            "ready": AUTH_READY,
+            "project_id": STACK_PROJECT_ID,
+            "publishable_key": STACK_PUBLISHABLE_CLIENT_KEY,
+        },
+    }
 
 
 @app.get("/api/summary")
-def summary():
-    """Compteurs globaux affichés en permanence dans la barre latérale."""
+def summary(me: dict = Depends(current_user)):
+    """Compteurs de mes projets, affichés en permanence dans la barre latérale."""
     with db() as conn:
         row = q(
             conn,
-            """select
+            f"""select
                  count(*) filter (where state='RUNNING') as running,
                  count(*) filter (where state='PAUSED')  as paused
-               from projects""",
+               from projects where {MINE}""",
+            me["id"],
         )[0]
         pending = q(
-            conn, "select count(*) as n from decisions where status='pending'"
+            conn,
+            f"""select count(*) as n from decisions d
+                join projects p on p.id = d.project_id
+                where d.status='pending' and {MINE.replace("owner_id", "p.owner_id")}""",
+            me["id"],
         )[0]["n"]
         return {"running": row["running"], "paused": row["paused"], "pending": pending}
 
 
 @app.get("/api/agents")
-def list_agents():
+def list_agents(me: dict = Depends(current_user)):
     with db() as conn:
-        return q(conn, "select * from agents order by created_at")
+        return q(conn, f"select * from agents where {MINE} order by created_at", me["id"])
 
 
 @app.post("/api/agents")
-def create_agent(body: AgentIn):
+def create_agent(body: AgentIn, me: dict = Depends(current_user)):
     with db() as conn:
         return q1(
             conn,
-            """insert into agents (name, description, role, instructions, model, temperature, accent)
-               values (%s,%s,%s,%s,%s,%s,%s) returning *""",
+            """insert into agents (owner_id, visibility, name, description, role,
+                                   instructions, model, temperature, accent)
+               values (%s,%s,%s,%s,%s,%s,%s,%s,%s) returning *""",
+            me["id"],
+            _vis(body.visibility),
             body.name,
             body.description,
             body.role,
@@ -200,12 +325,14 @@ def create_agent(body: AgentIn):
 
 
 @app.patch("/api/agents/{agent_id}")
-def update_agent(agent_id: str, body: AgentIn):
+def update_agent(agent_id: str, body: AgentIn, me: dict = Depends(current_user)):
     with db() as conn:
+        owned(conn, "agents", agent_id, me)
         row = q1(
             conn,
             """update agents set name=%s, description=%s, role=%s, instructions=%s,
-                                 model=%s, temperature=%s, accent=%s, updated_at=now()
+                                 model=%s, temperature=%s, accent=%s, visibility=%s,
+                                 updated_at=now()
                where id=%s returning *""",
             body.name,
             body.description,
@@ -214,29 +341,33 @@ def update_agent(agent_id: str, body: AgentIn):
             body.model,
             body.temperature,
             body.accent,
+            _vis(body.visibility),
             agent_id,
         )
         if not row:
-            raise HTTPException(404, "agent introuvable")
+            raise HTTPException(404, "Agent introuvable.")
         return row
 
 
 @app.delete("/api/agents/{agent_id}")
-def delete_agent(agent_id: str):
+def delete_agent(agent_id: str, me: dict = Depends(current_user)):
     with db() as conn:
+        owned(conn, "agents", agent_id, me)
         q(conn, "delete from agents where id=%s", agent_id)
     return {"ok": True}
 
 
 @app.get("/api/agents/{agent_id}/memory")
-def get_memory(agent_id: str):
+def get_memory(agent_id: str, me: dict = Depends(current_user)):
     with db() as conn:
+        readable(conn, "agents", agent_id, me)
         return q(conn, "select * from agent_memory where agent_id=%s order by created_at desc", agent_id)
 
 
 @app.post("/api/agents/{agent_id}/memory")
-def add_memory(agent_id: str, body: MemoryIn):
+def add_memory(agent_id: str, body: MemoryIn, me: dict = Depends(current_user)):
     with db() as conn:
+        owned(conn, "agents", agent_id, me)
         return q1(
             conn,
             "insert into agent_memory (agent_id, content) values (%s,%s) returning *",
@@ -246,8 +377,12 @@ def add_memory(agent_id: str, body: MemoryIn):
 
 
 @app.delete("/api/memory/{memory_id}")
-def del_memory(memory_id: str):
+def del_memory(memory_id: str, me: dict = Depends(current_user)):
     with db() as conn:
+        row = q1(conn, "select agent_id from agent_memory where id=%s", memory_id)
+        if not row:
+            raise HTTPException(404, "Souvenir introuvable.")
+        owned(conn, "agents", row["agent_id"], me)
         q(conn, "delete from agent_memory where id=%s", memory_id)
     return {"ok": True}
 
@@ -258,43 +393,64 @@ def del_memory(memory_id: str):
 
 
 @app.get("/api/projects")
-def list_projects():
+def list_projects(me: dict = Depends(current_user)):
     with db() as conn:
         return q(
             conn,
-            """select p.*, (select count(*) from project_agents pa where pa.project_id=p.id) as team_size,
+            f"""select p.*, (select count(*) from project_agents pa where pa.project_id=p.id) as team_size,
                       (select count(*) from artifacts a where a.project_id=p.id) as artifact_count,
                       (select count(*) from decisions d where d.project_id=p.id and d.status='pending')
                         as pending_count
-               from projects p order by p.created_at desc""",
+               from projects p where {MINE.replace("owner_id", "p.owner_id")}
+               order by p.created_at desc""",
+            me["id"],
         )
 
 
 @app.post("/api/projects")
-def create_project(body: ProjectIn):
+def create_project(body: ProjectIn, me: dict = Depends(current_user)):
     with db() as conn:
         return q1(
             conn,
-            "insert into projects (name, objective, max_revisions) values (%s,%s,%s) returning *",
+            """insert into projects (owner_id, visibility, name, objective, max_revisions)
+               values (%s,%s,%s,%s,%s) returning *""",
+            me["id"],
+            _vis(body.visibility),
             body.name,
             body.objective,
             body.max_revisions,
         )
 
 
-@app.delete("/api/projects/{project_id}")
-def delete_project(project_id: str):
+@app.patch("/api/projects/{project_id}")
+def update_project(project_id: str, body: ProjectIn, me: dict = Depends(current_user)):
     with db() as conn:
+        owned(conn, "projects", project_id, me)
+        return q1(
+            conn,
+            """update projects set name=%s, objective=%s, max_revisions=%s,
+                                   visibility=%s, updated_at=now()
+               where id=%s returning *""",
+            body.name,
+            body.objective,
+            body.max_revisions,
+            _vis(body.visibility),
+            project_id,
+        )
+
+
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str, me: dict = Depends(current_user)):
+    with db() as conn:
+        owned(conn, "projects", project_id, me)
         q(conn, "delete from projects where id=%s", project_id)
     return {"ok": True}
 
 
 @app.get("/api/projects/{project_id}")
-def get_project(project_id: str):
+def get_project(project_id: str, me: dict = Depends(current_user)):
     with db() as conn:
-        project = q1(conn, "select * from projects where id=%s", project_id)
-        if not project:
-            raise HTTPException(404, "projet introuvable")
+        project = readable(conn, "projects", project_id, me)
         team = q(
             conn,
             """select pa.role as team_role, pa.x, pa.y, a.*
@@ -312,8 +468,12 @@ def get_project(project_id: str):
 
 
 @app.put("/api/projects/{project_id}/team")
-def set_team(project_id: str, body: list[TeamMember]):
+def set_team(project_id: str, body: list[TeamMember], me: dict = Depends(current_user)):
     with db() as conn:
+        owned(conn, "projects", project_id, me)
+        # On ne compose une équipe qu'avec des agents qu'on a le droit de lire.
+        for m in body:
+            readable(conn, "agents", m.agent_id, me)
         q(conn, "delete from project_agents where project_id=%s", project_id)
         for m in body:
             q(
@@ -339,8 +499,9 @@ def set_team(project_id: str, body: list[TeamMember]):
 
 
 @app.put("/api/projects/{project_id}/edges")
-def set_edges(project_id: str, body: list[Edge]):
+def set_edges(project_id: str, body: list[Edge], me: dict = Depends(current_user)):
     with db() as conn:
+        owned(conn, "projects", project_id, me)
         q(conn, "delete from architecture_edges where project_id=%s", project_id)
         for e in body:
             q(
@@ -356,19 +517,18 @@ def set_edges(project_id: str, body: list[Edge]):
 
 
 @app.get("/api/projects/{project_id}/suggestions")
-def suggestions(project_id: str):
+def suggestions(project_id: str, me: dict = Depends(current_user)):
     """Agents existants que l'application propose d'ajouter au projet.
 
     L'application propose, elle ne recompose jamais l'équipe toute seule.
     """
     with db() as conn:
-        project = q1(conn, "select * from projects where id=%s", project_id)
-        if not project:
-            raise HTTPException(404, "projet introuvable")
+        project = readable(conn, "projects", project_id, me)
         candidates = q(
             conn,
-            """select * from agents where id not in
+            f"""select * from agents where {MINE} and id not in
                  (select agent_id from project_agents where project_id=%s)""",
+            me["id"],
             project_id,
         )
         objective = (project["objective"] + " " + project["name"]).lower()
@@ -395,8 +555,9 @@ def suggestions(project_id: str):
 
 
 @app.get("/api/projects/{project_id}/stream")
-def stream(project_id: str, after: int = 0):
+def stream(project_id: str, after: int = 0, me: dict = Depends(current_user)):
     with db() as conn:
+        readable(conn, "projects", project_id, me)
         messages = q(
             conn,
             "select * from messages where project_id=%s and id>%s order by id limit 300",
@@ -429,11 +590,12 @@ def stream(project_id: str, after: int = 0):
 
 
 @app.post("/api/decisions/{decision_id}/respond")
-def respond(decision_id: str, body: DecisionIn):
+def respond(decision_id: str, body: DecisionIn, me: dict = Depends(current_user)):
     with db() as conn:
         d = q1(conn, "select * from decisions where id=%s", decision_id)
         if not d:
-            raise HTTPException(404, "décision introuvable")
+            raise HTTPException(404, "Décision introuvable.")
+        owned(conn, "projects", d["project_id"], me)
         q(
             conn,
             "update decisions set status=%s, response=%s, resolved_at=now() where id=%s",
@@ -480,12 +642,10 @@ def respond(decision_id: str, body: DecisionIn):
 
 
 @app.post("/api/projects/{project_id}/control")
-def control(project_id: str, body: ControlIn):
+def control(project_id: str, body: ControlIn, me: dict = Depends(current_user)):
     action = body.action
     with db() as conn:
-        project = q1(conn, "select * from projects where id=%s", project_id)
-        if not project:
-            raise HTTPException(404, "projet introuvable")
+        project = owned(conn, "projects", project_id, me)
         cycle = q1(
             conn, "select * from cycles where project_id=%s order by created_at desc limit 1", project_id
         )
@@ -524,6 +684,162 @@ def control(project_id: str, body: ControlIn):
 
 
 # --------------------------------------------------------------------------
+# Partage public : explorer, dupliquer, récupérer l'existant
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/explore")
+def explore(
+    type: str = "agent",
+    q_: str = "",
+    role: str = "",
+    me: dict = Depends(current_user),
+):
+    """Éléments publics des autres comptes, filtrables.
+
+    On exclut ses propres éléments : ils sont déjà dans « Agents » et « Projets ».
+    """
+    like = f"%{q_.strip()}%"
+    with db() as conn:
+        if type == "project":
+            rows = q(
+                conn,
+                """select p.id, p.name, p.objective, p.created_at, p.owner_id,
+                          coalesce(u.name, u.email, 'un autre compte') as owner_label,
+                          (select count(*) from project_agents pa where pa.project_id=p.id) as team_size
+                   from projects p
+                   left join neon_auth.users_sync u on u.id = p.owner_id
+                   where p.visibility='public' and coalesce(p.owner_id,'') <> %s
+                     and (%s = '' or p.name ilike %s or p.objective ilike %s)
+                   order by p.created_at desc limit 60""",
+                me["id"], q_.strip(), like, like,
+            )
+        else:
+            rows = q(
+                conn,
+                """select a.id, a.name, a.description, a.role, a.model, a.accent,
+                          a.created_at, a.owner_id,
+                          coalesce(u.name, u.email, 'un autre compte') as owner_label
+                   from agents a
+                   left join neon_auth.users_sync u on u.id = a.owner_id
+                   where a.visibility='public' and coalesce(a.owner_id,'') <> %s
+                     and (%s = '' or a.role = %s)
+                     and (%s = '' or a.name ilike %s or a.description ilike %s)
+                   order by a.created_at desc limit 60""",
+                me["id"], role, role, q_.strip(), like, like,
+            )
+        return rows
+
+
+def _copy_agent(conn, src: dict, me: dict, suffix: str = " (copie)") -> dict:
+    """Copie autonome d'un agent, mémoire comprise, au nom du compte courant."""
+    new = q1(
+        conn,
+        """insert into agents (owner_id, visibility, name, description, role,
+                               instructions, model, temperature, accent)
+           values (%s,'private',%s,%s,%s,%s,%s,%s,%s) returning *""",
+        me["id"],
+        (src["name"] + suffix)[:200],
+        src["description"],
+        src["role"],
+        src["instructions"],
+        src["model"],
+        src["temperature"],
+        src["accent"],
+    )
+    for m in q(
+        conn, "select content from agent_memory where agent_id=%s", src["id"]
+    ):
+        q(
+            conn,
+            "insert into agent_memory (agent_id, content, source) values (%s,%s,'copie')",
+            new["id"],
+            m["content"],
+        )
+    return new
+
+
+@app.post("/api/agents/{agent_id}/duplicate")
+def duplicate_agent(agent_id: str, me: dict = Depends(current_user)):
+    with db() as conn:
+        src = readable(conn, "agents", agent_id, me)
+        return _copy_agent(conn, src, me)
+
+
+@app.post("/api/projects/{project_id}/duplicate")
+def duplicate_project(project_id: str, me: dict = Depends(current_user)):
+    """Copie profonde : le projet dupliqué ne dépend plus de l'original.
+
+    Les agents de l'équipe sont copiés eux aussi, sinon modifier un agent chez
+    soi reviendrait à modifier celui de quelqu'un d'autre.
+    """
+    with db() as conn:
+        src = readable(conn, "projects", project_id, me)
+        new = q1(
+            conn,
+            """insert into projects (owner_id, visibility, name, objective, max_revisions)
+               values (%s,'private',%s,%s,%s) returning *""",
+            me["id"],
+            (src["name"] + " (copie)")[:200],
+            src["objective"],
+            src["max_revisions"],
+        )
+        mapping: dict[str, str] = {}
+        for member in q(
+            conn,
+            """select pa.role as team_role, pa.x, pa.y, a.*
+               from project_agents pa join agents a on a.id = pa.agent_id
+               where pa.project_id=%s""",
+            project_id,
+        ):
+            copy = _copy_agent(conn, member, me, suffix="")
+            mapping[str(member["id"])] = str(copy["id"])
+            q(
+                conn,
+                """insert into project_agents (project_id, agent_id, role, x, y)
+                   values (%s,%s,%s,%s,%s)""",
+                new["id"], copy["id"], member["team_role"], member["x"], member["y"],
+            )
+        for e in q(
+            conn, "select * from architecture_edges where project_id=%s", project_id
+        ):
+            src_id = mapping.get(str(e["source_agent_id"]))
+            dst_id = mapping.get(str(e["target_agent_id"]))
+            if src_id and dst_id:
+                q(
+                    conn,
+                    """insert into architecture_edges
+                         (project_id, source_agent_id, target_agent_id, kind)
+                       values (%s,%s,%s,%s) on conflict do nothing""",
+                    new["id"], src_id, dst_id, e["kind"],
+                )
+        return new
+
+
+@app.get("/api/legacy")
+def legacy_count(me: dict = Depends(current_user)):
+    """Combien d'éléments datent d'avant les comptes et attendent un propriétaire."""
+    with db() as conn:
+        return {
+            "agents": q(conn, "select count(*) as n from agents where owner_id is null")[0]["n"],
+            "projects": q(conn, "select count(*) as n from projects where owner_id is null")[0]["n"],
+        }
+
+
+@app.post("/api/legacy/claim")
+def claim_legacy(me: dict = Depends(current_user)):
+    """Rattache à mon compte tout ce qui a été créé avant les comptes.
+
+    Premier arrivé, premier servi : une fois réclamés, ces éléments ont un
+    propriétaire et ne sont plus visibles par les autres.
+    """
+    with db() as conn:
+        a = q(conn, "update agents set owner_id=%s where owner_id is null returning id", me["id"])
+        p = q(conn, "update projects set owner_id=%s where owner_id is null returning id", me["id"])
+        return {"agents": len(a), "projects": len(p)}
+
+
+# --------------------------------------------------------------------------
 # Cycle : création et exécution pas à pas
 # --------------------------------------------------------------------------
 
@@ -550,8 +866,9 @@ def enqueue(conn, project_id, cycle_id):
 
 
 @app.post("/api/projects/{project_id}/cycles")
-def start_cycle(project_id: str, body: CycleIn):
+def start_cycle(project_id: str, body: CycleIn, me: dict = Depends(current_user)):
     with db() as conn:
+        owned(conn, "projects", project_id, me)
         team = q(
             conn,
             """select pa.role as team_role, a.* from project_agents pa
@@ -581,13 +898,22 @@ def start_cycle(project_id: str, body: CycleIn):
 
 
 @app.post("/api/tick")
-def tick():
-    """Exécute exactement un step d'orchestration, puis rend la main."""
+def tick(me: dict | None = Depends(optional_user)):
+    """Exécute exactement un step d'orchestration, puis rend la main.
+
+    Un appelant ne fait jamais avancer que ses propres projets. Le cron quotidien
+    de Vercel n'étant pas authentifié, il ne fait rien : l'avancement autonome
+    reviendra avec un jeton de service dédié.
+    """
+    if me is None:
+        return {"did": "unauthenticated"}
     with db() as conn:
         job = q1(
             conn,
-            """select * from jobs where status='queued' and run_after<=now()
-               order by id for update skip locked limit 1""",
+            """select j.* from jobs j join projects p on p.id = j.project_id
+               where j.status='queued' and j.run_after<=now() and p.owner_id=%s
+               order by j.id for update of j skip locked limit 1""",
+            me["id"],
         )
         if not job:
             return {"did": "nothing"}
@@ -964,18 +1290,27 @@ SEED_AGENTS = [
 
 
 @app.post("/api/seed")
-def seed():
+def seed(me: dict = Depends(current_user)):
     with db() as conn:
-        existing = q(conn, "select count(*) as n from agents")[0]["n"]
+        existing = q(
+            conn, f"select count(*) as n from agents where {MINE}", me["id"]
+        )[0]["n"]
         if existing:
-            return {"ok": True, "skipped": True}
+            project = q1(
+                conn,
+                f"select id from projects where {MINE} order by created_at limit 1",
+                me["id"],
+            )
+            return {"ok": True, "skipped": True,
+                    "project_id": str(project["id"]) if project else None}
         created = []
         for name, role, description, instructions, accent in SEED_AGENTS:
             created.append(
                 q1(
                     conn,
-                    """insert into agents (name, description, role, instructions, accent)
-                       values (%s,%s,%s,%s,%s) returning *""",
+                    """insert into agents (owner_id, name, description, role, instructions, accent)
+                       values (%s,%s,%s,%s,%s,%s) returning *""",
+                    me["id"],
                     name,
                     description,
                     role,
@@ -985,7 +1320,9 @@ def seed():
             )
         project = q1(
             conn,
-            """insert into projects (name, objective) values (%s,%s) returning *""",
+            """insert into projects (owner_id, name, objective)
+               values (%s,%s,%s) returning *""",
+            me["id"],
             "Contenu organique B2B",
             "Générer des leads B2B qualifiés grâce à du contenu organique, sans publicité.",
         )

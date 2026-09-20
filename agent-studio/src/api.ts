@@ -1,12 +1,20 @@
+import * as auth from "./auth";
+
 export type Agent = {
   id: string; name: string; description: string; role: string;
   instructions: string; model: string; temperature: number | null; accent: string;
+  visibility?: string; owner_id?: string | null;
+};
+export type PublicAgent = Agent & { owner_label: string };
+export type PublicProject = {
+  id: string; name: string; objective: string; owner_label: string; team_size: number;
 };
 export type TeamMember = Agent & { team_role: string; x: number; y: number };
 export type Edge = { id: string; source_agent_id: string; target_agent_id: string; kind: string };
 export type Project = {
   id: string; name: string; objective: string; state: string; max_revisions: number;
   team_size?: number; artifact_count?: number; pending_count?: number;
+  visibility?: string; owner_id?: string | null;
 };
 export type Cycle = {
   id: string; status: string; brief: string; cursor: number; step_count: number;
@@ -21,17 +29,47 @@ export type Summary = { running: number; paused: number; pending: number };
 export type Artifact = { id: string; agent_name: string; type: string; title: string; body: string };
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    ...init,
-    headers: { "content-type": "application/json", ...(init?.headers || {}) },
-  });
-  if (!res.ok) throw new Error((await res.text()).slice(0, 300));
+  const send = () =>
+    fetch(path, {
+      ...init,
+      headers: {
+        "content-type": "application/json",
+        ...(auth.accessToken() ? { authorization: `Bearer ${auth.accessToken()}` } : {}),
+        ...(init?.headers || {}),
+      },
+    });
+
+  let res = await send();
+  // Le jeton d'accès vit une heure : on le renouvelle une fois, en silence,
+  // plutôt que d'éjecter l'utilisateur en plein travail.
+  if (res.status === 401 && (await auth.refresh())) res = await send();
+
+  if (!res.ok) {
+    let message = (await res.text()).slice(0, 400);
+    try {
+      const parsed = JSON.parse(message);
+      if (parsed?.detail) message = parsed.detail;
+    } catch {
+      /* message déjà lisible */
+    }
+    throw new Error(message);
+  }
   return res.json();
 }
 
 export const api = {
-  state: () => call<{ db: boolean; db_detail: string; live: boolean; mode: string }>("/api/state"),
+  state: () => call<{ db: boolean; db_detail: string; live: boolean; mode: string;
+                      auth: auth.AuthConfig }>("/api/state"),
   summary: () => call<Summary>("/api/summary"),
+
+  explore: (type: "agent" | "project", search: string, role: string) =>
+    call<any[]>(`/api/explore?type=${type}&q_=${encodeURIComponent(search)}&role=${role}`),
+  duplicateAgent: (id: string) => call<Agent>(`/api/agents/${id}/duplicate`, { method: "POST" }),
+  duplicateProject: (id: string) => call<Project>(`/api/projects/${id}/duplicate`, { method: "POST" }),
+  legacy: () => call<{ agents: number; projects: number }>("/api/legacy"),
+  claimLegacy: () => call<{ agents: number; projects: number }>("/api/legacy/claim", { method: "POST" }),
+  updateProject: (id: string, b: Partial<Project>) =>
+    call<Project>(`/api/projects/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
   seed: () => call<any>("/api/seed", { method: "POST" }),
 
   agents: () => call<Agent[]>("/api/agents"),

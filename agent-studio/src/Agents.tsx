@@ -115,6 +115,7 @@ export function Agents({ onChanged, autoOpenCreate, onLoadDemo, seeding }: {
                 <div className="foot">
                   <span className="tag">{ROLES.find((r) => r[0] === a.role)?.[1] || a.role}</span>
                   <span className="tag">{a.model}</span>
+                  {a.visibility === "public" && <span className="tag on">public</span>}
                   <div style={{ flex: 1 }} />
                   <button className="btn sm ghost danger"
                     onClick={(e) => { e.stopPropagation(); remove(a); }}>Supprimer</button>
@@ -164,6 +165,19 @@ export function Agents({ onChanged, autoOpenCreate, onLoadDemo, seeding }: {
                   </select>
                 </label>
               </div>
+
+              <label className="f">
+                <span>Visibilité</span>
+                <select className="f" value={draft.visibility || "private"}
+                  onChange={(e) => setDraft({ ...draft, visibility: e.target.value })}>
+                  <option value="private">Privé — vous seul le voyez</option>
+                  <option value="public">Public — visible dans Explorer, duplicable par d'autres</option>
+                </select>
+                <span className="small muted" style={{ display: "block", marginTop: 5, lineHeight: 1.5 }}>
+                  Publier partage le nom, la description et les instructions. Les autres comptes
+                  n'obtiennent qu'une copie : vos modifications ultérieures ne les suivent pas.
+                </span>
+              </label>
 
               {draft.id && (
                 <div style={{ marginTop: 6 }}>
