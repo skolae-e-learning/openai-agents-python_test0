@@ -1,6 +1,6 @@
 // Service worker minimal : les données doivent rester fraîches, seuls les fichiers
 // de l'interface sont mis en cache.
-const CACHE = "agent-studio-v1";
+const CACHE = "agent-studio-v2";
 
 self.addEventListener("install", (e) => {
   self.skipWaiting();
@@ -22,6 +22,26 @@ self.addEventListener("fetch", (e) => {
   // L'API n'est jamais servie depuis le cache : un cycle en cours doit être exact.
   if (url.pathname.startsWith("/api/")) return;
 
+  // Navigation et index.html : réseau d'abord, pour ne jamais servir indéfiniment
+  // une page obsolète qui référencerait des fichiers déjà supprimés d'un déploiement
+  // ultérieur. Le cache ne sert qu'en secours hors-ligne.
+  if (e.request.mode === "navigate" || url.pathname === "/index.html") {
+    e.respondWith(
+      fetch(e.request)
+        .then((res) => {
+          if (res.ok) {
+            const copy = res.clone();
+            caches.open(CACHE).then((c) => c.put(e.request, copy));
+          }
+          return res;
+        })
+        .catch(() => caches.match(e.request).then((hit) => hit || caches.match("/"))),
+    );
+    return;
+  }
+
+  // Fichiers statiques (JS/CSS content-hashés, immuables par construction) :
+  // cache d'abord, sans risque puisqu'un contenu différent produit une URL différente.
   e.respondWith(
     caches.match(e.request).then((hit) =>
       hit ||

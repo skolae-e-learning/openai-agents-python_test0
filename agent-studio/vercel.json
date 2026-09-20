@@ -4,7 +4,7 @@
   },
   "rewrites": [
     { "source": "/api/(.*)", "destination": "/api/index" },
-    { "source": "/((?!api/).*)", "destination": "/index.html" }
+    { "source": "/((?!api/|assets/|sw\\.js|manifest\\.webmanifest|icon-.*\\.png|favicon\\.ico|robots\\.txt).*)", "destination": "/index.html" }
   ],
   "crons": [{ "path": "/api/tick", "schedule": "0 6 * * *" }]
 }
