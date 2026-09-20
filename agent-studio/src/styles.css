@@ -61,10 +61,11 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .brand b { font-size: 14px; letter-spacing: -0.01em; }
 .brand span { color: var(--muted); font-size: 11px; display: block; font-weight: 400; }
 .navbtn {
-  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  display: flex; align-items: center; justify-content: flex-start; gap: 8px;
   padding: 7px 10px; border-radius: 8px; border: 0; background: transparent;
   color: var(--ink-2); cursor: pointer; text-align: left; width: 100%;
 }
+.navico { font-size: 14px; line-height: 1; flex: none; }
 .navbtn:hover { background: var(--panel-2); color: var(--ink); }
 .navbtn.on { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
 .side-foot { margin-top: auto; padding: 10px 8px 0; border-top: 1px solid var(--line-soft); }
@@ -82,7 +83,7 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .who { font-size: 11.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; margin-bottom: 2px; }
 
-.counts { display: flex; gap: 5px; align-items: center; }
+.counts { display: flex; gap: 5px; align-items: center; margin-left: auto; }
 .counts .ct { font-size: 10.5px; font-variant-numeric: tabular-nums; padding: 1px 5px;
   border-radius: 20px; white-space: nowrap; font-weight: 600; }
 .counts .ct.ok { color: var(--ok); background: color-mix(in srgb, var(--ok) 14%, transparent); }
@@ -100,9 +101,26 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .body { padding: 22px 26px 60px; overflow: auto; flex: 1; }
 .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 420px); gap: 18px; align-items: start; }
 @media (max-width: 1080px) { .cols { grid-template-columns: 1fr; } }
-/* En dessous de 1080px seule la colonne de contenu se replie : la barre latérale
-   garde son libellé « Agents » visible, c'est le seul chemin pour en créer un. */
-@media (max-width: 560px) { .side { width: 68px; } .brand b, .brand span, .navbtn span:last-child, .lbl-txt { display: none; } }
+/* En dessous de 560px la barre devient un rail. Règle tenue : tout ce qui se clique
+   garde ses mots — libellé sous le glyphe — et seule la décoration se réduit. Un
+   rail muet laissait des boutons vides, sans rien pour comprendre où l'on va. */
+@media (max-width: 560px) {
+  .side { width: 80px; padding: 14px 6px; }
+  .brand { justify-content: center; padding: 4px 0 14px; }
+  .brand b { display: none; }
+  .navbtn { flex-direction: column; gap: 3px; padding: 8px 3px; justify-content: center; text-align: center; }
+  .navbtn .lbl-txt { font-size: 9.5px; line-height: 1.15; }
+  .navico { font-size: 15px; }
+  .counts { margin-left: 0; }
+  .side-foot { padding: 10px 2px 0; }
+  /* Courriel et libellés d'état : informatifs, pas cliquables. Leur `title` garde le sens. */
+  .side-foot .who, .side-foot .row .lbl-txt { display: none; }
+  .side-foot .btn { font-size: 9.5px; line-height: 1.2; white-space: normal; padding: 4px 3px; }
+  /* Sans repli, le bouton d'action comprime le titre jusqu'à un mot par ligne. */
+  .head { padding: 14px 12px 12px; flex-wrap: wrap; gap: 10px; }
+  .head .spacer { display: none; }
+  .body { padding: 16px 12px 48px; }
+}
 
 /* ---------- éléments ---------- */
 .card {

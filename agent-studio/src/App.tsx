@@ -97,9 +97,11 @@ export default function App() {
   }
   if (!me) return <Login onSignedIn={setMe} />;
 
-  const nav = (target: View, label: string, extra?: React.ReactNode) => (
+  // Le glyphe est hors de `lbl-txt` : replié, le rail doit rester compréhensible.
+  const nav = (target: View, label: string, icon: string, extra?: React.ReactNode) => (
     <button className={"navbtn" + (view.name === target.name ? " on" : "")}
-      onClick={() => setView(target)}>
+      title={label} aria-label={label} onClick={() => setView(target)}>
+      <span className="navico" aria-hidden>{icon}</span>
       <span className="lbl-txt">{label}</span>
       {extra}
     </button>
@@ -118,30 +120,32 @@ export default function App() {
           <b>Agent Studio<span>équipes d'agents IA</span></b>
         </div>
 
-        {nav({ name: "projects" }, "Projets", (
+        {nav({ name: "projects" }, "Projets", "▤", (
           <span className="counts lbl-txt">
             {!!summary?.running && <span className="ct ok" title={`${summary.running} projet(s) en cours`}>▶ {summary.running}</span>}
             {!!summary?.paused && <span className="ct warn" title={`${summary.paused} projet(s) en pause`}>⏸ {summary.paused}</span>}
           </span>
         ))}
-        {nav({ name: "agents" }, "Agents", <span>◇</span>)}
-        {nav({ name: "explore" }, "Explorer", <span>◎</span>)}
+        {nav({ name: "agents" }, "Agents", "◇")}
+        {nav({ name: "explore" }, "Explorer", "◎")}
 
         <div className="side-foot small muted">
           <div className="who lbl-txt" title={me.email}>{me.email}</div>
-          <button className="btn sm ghost lbl-txt" style={{ paddingLeft: 0 }} onClick={leave}>
+          <button className="btn sm ghost" style={{ paddingLeft: 0 }} title={me.email} onClick={leave}>
             Se déconnecter
           </button>
-          <div className="row" style={{ gap: 6, marginTop: 10 }}>
+          <div className="row" style={{ gap: 6, marginTop: 10 }}
+            title={status?.db ? "base connectée" : "base injoignable"}>
             <span className="dot" style={{ background: status?.db ? "var(--ok)" : "var(--stop)" }} />
             <span className="lbl-txt">{status?.db ? "base connectée" : "base injoignable"}</span>
           </div>
-          <div className="row" style={{ gap: 6, marginTop: 6 }}>
+          <div className="row" style={{ gap: 6, marginTop: 6 }}
+            title={status?.live ? "modèles actifs" : "mode démo"}>
             <span className="dot" style={{ background: status?.live ? "var(--ok)" : "var(--warn)" }} />
             <span className="lbl-txt">{status?.live ? "modèles actifs" : "mode démo"}</span>
           </div>
           {installer && (
-            <button className="btn sm lbl-txt" style={{ marginTop: 10 }}
+            <button className="btn sm" style={{ marginTop: 10 }} title="Installer l'application"
               onClick={async () => { installer.prompt(); await installer.userChoice; setInstaller(null); }}>
               Installer l'application
             </button>
