@@ -61,6 +61,10 @@ create table if not exists cycles (
   brief      text not null default '',
   status     text not null default 'queued',
   step_count int  not null default 0,
+  plan       jsonb not null default '[]'::jsonb,     -- steps résolus par build_plan
+  cursor     int  not null default 0,                -- index du prochain step à exécuter
+  revisions  int  not null default 0,                -- boucles de révision déjà consommées
+  note       text not null default '',               -- motif d'arrêt lisible par l'humain
   demo       boolean not null default false,
   created_at timestamptz not null default now(),
   ended_at   timestamptz

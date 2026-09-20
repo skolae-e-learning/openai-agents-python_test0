@@ -24,16 +24,41 @@ export type Message = {
   id: number; agent_name: string; kind: string; depth: number;
   title: string; body: string; payload: any; created_at: string;
 };
-export type Decision = { id: string; title: string; detail: string; status: string; payload?: any };
+export type Connector = {
+  id: string; kind: string; label: string; name: string; capabilities: string[];
+  config: Record<string, string>; secret_set: boolean;
+  status: "untested" | "ok" | "error"; status_detail: string; last_tested_at: string | null;
+};
+export type ConnectorField = { key: string; label: string; required: boolean; placeholder?: string };
+export type ConnectorKind = {
+  kind: string; label: string; capabilities: string[]; secret_label: string;
+  secret_required: boolean; fields: ConnectorField[]; help: string;
+};
+export type CycleImage = {
+  id: string; filename: string; content_type: string; caption: string;
+  created_at: string; url: string;
+};
+export type DecisionPayload = {
+  reason?: { why?: string; agent?: string; action?: string };
+  required_capabilities?: string[];
+  connectors?: Connector[];
+  missing?: string[];
+};
+export type Decision = {
+  id: string; title: string; detail: string; status: string; payload?: DecisionPayload;
+};
 export type Summary = { running: number; paused: number; pending: number };
 export type Artifact = { id: string; agent_name: string; type: string; title: string; body: string };
 
 async function call<T>(path: string, init?: RequestInit): Promise<T> {
+  // Un envoi multipart doit laisser le navigateur poser lui-même le type et sa
+  // frontière : un content-type imposé ici rendrait le corps illisible côté serveur.
+  const isForm = init?.body instanceof FormData;
   const send = () =>
     fetch(path, {
       ...init,
       headers: {
-        "content-type": "application/json",
+        ...(isForm ? {} : { "content-type": "application/json" }),
         ...(auth.accessToken() ? { authorization: `Bearer ${auth.accessToken()}` } : {}),
         ...(init?.headers || {}),
       },
@@ -59,7 +84,7 @@ async function call<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   state: () => call<{ db: boolean; db_detail: string; live: boolean; mode: string;
-                      auth: auth.AuthConfig }>("/api/state"),
+                      connectors_ready: boolean; auth: auth.AuthConfig }>("/api/state"),
   summary: () => call<Summary>("/api/summary"),
 
   explore: (type: "agent" | "project", search: string, role: string) =>
@@ -103,9 +128,31 @@ export const api = {
     call<{ messages: Message[]; cycle: Cycle | null; project: Project; decisions: Decision[]; artifacts: Artifact[] }>(
       `/api/projects/${id}/stream?after=${after}`,
     ),
-  respond: (id: string, status: string, response = "") =>
-    call<any>(`/api/decisions/${id}/respond`, { method: "POST", body: JSON.stringify({ status, response }) }),
+  respond: (id: string, status: string, response = "", connectors: string[] = []) =>
+    call<any>(`/api/decisions/${id}/respond`, {
+      method: "POST",
+      body: JSON.stringify({ status, response, connectors }),
+    }),
   tick: () => call<{ did: string }>("/api/tick", { method: "POST" }),
+
+  connectorKinds: () =>
+    call<{ ready: boolean; capabilities: string[]; kinds: ConnectorKind[] }>("/api/connectors/kinds"),
+  connectors: () => call<Connector[]>("/api/connectors"),
+  createConnector: (b: { kind: string; name: string; config: Record<string, string>; secret: string }) =>
+    call<Connector>("/api/connectors", { method: "POST", body: JSON.stringify(b) }),
+  updateConnector: (id: string, b: { kind: string; name: string; config: Record<string, string>; secret: string }) =>
+    call<Connector>(`/api/connectors/${id}`, { method: "PATCH", body: JSON.stringify(b) }),
+  deleteConnector: (id: string) => call<any>(`/api/connectors/${id}`, { method: "DELETE" }),
+  testConnector: (id: string) => call<Connector>(`/api/connectors/${id}/test`, { method: "POST" }),
+
+  cycleImages: (cycleId: string) => call<CycleImage[]>(`/api/cycles/${cycleId}/images`),
+  addCycleImage: (cycleId: string, file: File, caption: string) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("caption", caption);
+    return call<CycleImage>(`/api/cycles/${cycleId}/images`, { method: "POST", body: form });
+  },
+  deleteImage: (id: string) => call<any>(`/api/images/${id}`, { method: "DELETE" }),
 };
 
 export const ACCENTS: Record<string, string> = {

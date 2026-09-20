@@ -18,7 +18,7 @@ from typing import Any
 
 import jwt
 import psycopg
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from jwt import PyJWKClient
 from psycopg.rows import dict_row
 from pydantic import BaseModel
@@ -28,7 +28,11 @@ _FALLBACK_DSN = ""
 
 DATABASE_URL = os.environ.get("DATABASE_URL") or _FALLBACK_DSN
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-LIVE = bool(OPENAI_API_KEY)
+
+# Chiffrement des secrets de connexion. Absente, l'application refuse d'enregistrer
+# un secret plutôt que de le stocker en clair.
+APP_SECRET_KEY = os.environ.get("APP_SECRET_KEY", "")
+CONNECTORS_READY = bool(APP_SECRET_KEY)
 
 # Neon Auth (Stack Auth). Ces deux valeurs sont publiques par conception : la clé
 # publiable est faite pour vivre dans le navigateur. Le secret de signature, lui,
@@ -172,6 +176,366 @@ def now() -> datetime:
 
 
 # --------------------------------------------------------------------------
+# Connexions externes : secrets, capacités, types
+# --------------------------------------------------------------------------
+
+# Taxonomie volontairement courte. C'est elle qui rend les alternatives
+# calculables : deux connexions qui couvrent `mail.send` sont interchangeables
+# pour l'arbitrage, quel que soit le fournisseur derrière.
+CAPABILITIES = [
+    "llm.text",
+    "llm.image",
+    "audio.tts",
+    "mail.send",
+    "workspace.write",
+    "repo.write",
+    "deploy",
+    "http.generic",
+]
+
+# Ce que la publication peut mobiliser. Le step de garde les déclare, `run_step`
+# les résout contre les connexions du propriétaire du projet.
+PUBLISH_CAPABILITIES = ["mail.send", "workspace.write", "repo.write", "deploy", "http.generic"]
+
+# Chaque type décrit ses capacités et les champs de configuration attendus.
+# L'écran Connecteurs est piloté par ces données : ajouter un type ne touche
+# pas le front.
+CONNECTOR_KINDS: dict[str, dict] = {
+    "http": {
+        "label": "HTTP générique",
+        "capabilities": ["http.generic"],
+        "secret_label": "Jeton (optionnel, envoyé en Authorization: Bearer)",
+        "secret_required": False,
+        "fields": [
+            {"key": "url", "label": "URL appelée", "required": True,
+             "placeholder": "https://exemple.test/hook"},
+            {"key": "headers", "label": "En-têtes supplémentaires (JSON)", "required": False,
+             "placeholder": '{"X-Token": "…"}'},
+        ],
+        "help": "Rattrapage universel : tout service acceptant un POST devient utilisable.",
+    },
+    "resend": {
+        "label": "Courriel (Resend)",
+        "capabilities": ["mail.send"],
+        "secret_label": "Clé API Resend",
+        "secret_required": True,
+        "fields": [
+            {"key": "from", "label": "Adresse d'envoi", "required": True,
+             "placeholder": "studio@votre-domaine.fr"},
+            {"key": "to", "label": "Destinataire", "required": True,
+             "placeholder": "vous@exemple.fr"},
+        ],
+        "help": "L'adresse d'envoi doit appartenir à un domaine vérifié chez Resend.",
+    },
+    "notion": {
+        "label": "Notion",
+        "capabilities": ["workspace.write"],
+        "secret_label": "Jeton d'intégration interne",
+        "secret_required": True,
+        "fields": [
+            {"key": "parent_page_id", "label": "Page parente", "required": True,
+             "placeholder": "2f0e…  (identifiant de la page)"},
+        ],
+        "help": "La page parente doit être partagée avec l'intégration côté Notion.",
+    },
+    "github": {
+        "label": "GitHub",
+        "capabilities": ["repo.write"],
+        "secret_label": "Jeton d'accès personnel",
+        "secret_required": True,
+        "fields": [
+            {"key": "repo", "label": "Dépôt", "required": True, "placeholder": "compte/depot"},
+            {"key": "path", "label": "Dossier de destination", "required": False,
+             "placeholder": "productions"},
+            {"key": "branch", "label": "Branche", "required": False, "placeholder": "main"},
+        ],
+        "help": "Le jeton doit porter le droit d'écriture sur le contenu du dépôt.",
+    },
+    "vercel": {
+        "label": "Vercel",
+        "capabilities": ["deploy"],
+        "secret_label": "Jeton d'API",
+        "secret_required": True,
+        "fields": [
+            {"key": "deploy_hook_url", "label": "URL du hook de déploiement", "required": True,
+             "placeholder": "https://api.vercel.com/v1/integrations/deploy/…"},
+        ],
+        "help": "Le hook se crée dans les réglages Git du projet Vercel.",
+    },
+    "openai": {
+        "label": "OpenAI",
+        "capabilities": ["llm.text", "llm.image"],
+        "secret_label": "Clé API",
+        "secret_required": True,
+        "fields": [],
+        "help": "Fait passer vos cycles en mode réel, sans variable d'environnement serveur.",
+    },
+    "anthropic": {
+        "label": "Anthropic",
+        "capabilities": ["llm.text"],
+        "secret_label": "Clé API",
+        "secret_required": True,
+        "fields": [],
+        "help": "Enregistrée et testée ; la production de contenu passe aujourd'hui par OpenAI.",
+    },
+    "elevenlabs": {
+        "label": "ElevenLabs",
+        "capabilities": ["audio.tts"],
+        "secret_label": "Clé API",
+        "secret_required": True,
+        "fields": [],
+        "help": "Synthèse vocale, mobilisable à la publication.",
+    },
+}
+
+
+def _fernet():
+    from cryptography.fernet import Fernet
+
+    return Fernet(APP_SECRET_KEY.encode())
+
+
+def seal(plain: str) -> str:
+    """Chiffre un secret. Sans clé de chiffrement, on refuse plutôt que stocker en clair."""
+    if not plain:
+        return ""
+    if not CONNECTORS_READY:
+        raise HTTPException(
+            500,
+            "APP_SECRET_KEY n'est pas configurée sur le déploiement : impossible "
+            "d'enregistrer un secret en sécurité.",
+        )
+    return _fernet().encrypt(plain.encode()).decode()
+
+
+def unseal(token: str) -> str:
+    """Déchiffre un secret. Une valeur illisible vaut secret absent, jamais une exception."""
+    if not token or not CONNECTORS_READY:
+        return ""
+    try:
+        return _fernet().decrypt(token.encode()).decode()
+    except Exception:
+        return ""
+
+
+def own_connector(conn, connector_id: str, me: dict) -> dict:
+    """Une connexion n'est jamais publique : `readable()` ne s'applique pas ici."""
+    row = q1(conn, "select * from connectors where id=%s", connector_id)
+    if not row or row["owner_id"] != me["id"]:
+        raise HTTPException(404, "Connexion introuvable.")
+    return row
+
+
+def public_connector(row: dict) -> dict:
+    """Vue sortante d'une connexion : le secret n'en sort jamais."""
+    return {
+        "id": str(row["id"]),
+        "kind": row["kind"],
+        "label": CONNECTOR_KINDS.get(row["kind"], {}).get("label", row["kind"]),
+        "name": row["name"],
+        "capabilities": list(row["capabilities"] or []),
+        "config": row["config"] or {},
+        "secret_set": bool(row["secret_enc"]),
+        "status": row["status"],
+        "status_detail": row["status_detail"],
+        "last_tested_at": row["last_tested_at"],
+    }
+
+
+def connectors_covering(conn, owner_id: str | None, capabilities: list[str]) -> list[dict]:
+    """Connexions du propriétaire couvrant au moins une des capacités demandées."""
+    if not owner_id or not capabilities:
+        return []
+    rows = q(
+        conn,
+        "select * from connectors where owner_id=%s and capabilities && %s order by name",
+        owner_id,
+        capabilities,
+    )
+    return rows
+
+
+def llm_key_for(conn, owner_id: str | None) -> str:
+    """Clé OpenAI à utiliser : celle du propriétaire si elle existe, sinon celle du serveur."""
+    if owner_id:
+        row = q1(
+            conn,
+            """select secret_enc from connectors
+               where owner_id=%s and kind='openai' and secret_enc <> ''
+               order by (status='ok') desc, created_at limit 1""",
+            owner_id,
+        )
+        if row:
+            key = unseal(row["secret_enc"])
+            if key:
+                return key
+    return OPENAI_API_KEY
+
+
+def _extra_headers(config: dict) -> dict:
+    """En-têtes saisis à la main. Une saisie invalide est ignorée, pas fatale."""
+    raw = config.get("headers") or ""
+    if isinstance(raw, dict):
+        return {str(k): str(v) for k, v in raw.items()}
+    try:
+        parsed = json.loads(raw) if str(raw).strip() else {}
+        return {str(k): str(v) for k, v in parsed.items()} if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def _request(method: str, url: str, *, headers=None, json_body=None, timeout: float = 15.0):
+    import httpx
+
+    with httpx.Client(timeout=timeout, follow_redirects=True) as client:
+        return client.request(method, url, headers=headers or {}, json=json_body)
+
+
+def probe_connector(row: dict) -> tuple[bool, str]:
+    """Un appel minimal et sans effet de bord, pour dire si la connexion répond.
+
+    Toute erreur réseau devient un message lisible : un test qui échoue est une
+    information, pas une panne de l'application.
+    """
+    kind = row["kind"]
+    secret = unseal(row["secret_enc"])
+    config = row["config"] or {}
+    if CONNECTOR_KINDS.get(kind, {}).get("secret_required") and not secret:
+        return False, "Aucun secret enregistré, ou secret illisible avec la clé actuelle."
+
+    try:
+        if kind == "openai":
+            r = _request("GET", "https://api.openai.com/v1/models",
+                         headers={"Authorization": f"Bearer {secret}"})
+        elif kind == "anthropic":
+            r = _request("GET", "https://api.anthropic.com/v1/models",
+                         headers={"x-api-key": secret, "anthropic-version": "2023-06-01"})
+        elif kind == "elevenlabs":
+            r = _request("GET", "https://api.elevenlabs.io/v1/user",
+                         headers={"xi-api-key": secret})
+        elif kind == "resend":
+            r = _request("GET", "https://api.resend.com/domains",
+                         headers={"Authorization": f"Bearer {secret}"})
+        elif kind == "notion":
+            r = _request("GET", "https://api.notion.com/v1/users/me",
+                         headers={"Authorization": f"Bearer {secret}",
+                                  "Notion-Version": "2022-06-28"})
+        elif kind == "github":
+            r = _request("GET", "https://api.github.com/user",
+                         headers={"Authorization": f"Bearer {secret}",
+                                  "Accept": "application/vnd.github+json"})
+        elif kind == "vercel":
+            r = _request("GET", "https://api.vercel.com/v2/user",
+                         headers={"Authorization": f"Bearer {secret}"})
+        elif kind == "http":
+            # Volontairement en GET : tester ne doit pas déclencher l'action.
+            headers = _extra_headers(config)
+            if secret:
+                headers.setdefault("Authorization", f"Bearer {secret}")
+            r = _request("GET", str(config.get("url", "")), headers=headers)
+            # Un webhook qui n'accepte que POST répond 405 : il est joignable.
+            if r.status_code < 500:
+                return True, f"Joignable (HTTP {r.status_code})."
+            return False, f"Le service répond HTTP {r.status_code}."
+        else:
+            return False, f"Type de connexion inconnu : « {kind} »."
+    except Exception as exc:
+        return False, f"Contact impossible : {str(exc)[:200]}"
+
+    if r.status_code < 300:
+        return True, "Connexion établie."
+    if r.status_code in (401, 403):
+        return False, f"Refusé (HTTP {r.status_code}) : le secret est invalide ou insuffisant."
+    return False, f"Réponse inattendue : HTTP {r.status_code}. {r.text[:160]}"
+
+
+def publish_through(row: dict, project: dict, cycle: dict, artifacts: list[dict]) -> tuple[bool, str]:
+    """Exécute réellement la publication via une connexion, et dit ce qui s'est passé.
+
+    Appelée seulement après une approbation humaine explicite, et seulement pour
+    les connexions que l'humain a laissées cochées.
+    """
+    kind = row["kind"]
+    secret = unseal(row["secret_enc"])
+    config = row["config"] or {}
+    title = f"{project['name']} — {cycle.get('brief') or 'cycle terminé'}"
+    body = "\n\n".join(f"## {a['title']}\n\n{a['body']}" for a in artifacts) or "(aucune production)"
+
+    try:
+        if kind == "http":
+            headers = _extra_headers(config)
+            if secret:
+                headers.setdefault("Authorization", f"Bearer {secret}")
+            r = _request(
+                "POST", str(config.get("url", "")), headers=headers,
+                json_body={
+                    "project": project["name"],
+                    "objective": project.get("objective", ""),
+                    "cycle_id": str(cycle["id"]),
+                    "brief": cycle.get("brief", ""),
+                    "artifacts": [
+                        {"title": a["title"], "agent": a["agent_name"], "body": a["body"]}
+                        for a in artifacts
+                    ],
+                },
+            )
+        elif kind == "resend":
+            r = _request(
+                "POST", "https://api.resend.com/emails",
+                headers={"Authorization": f"Bearer {secret}"},
+                json_body={"from": config.get("from", ""), "to": [config.get("to", "")],
+                           "subject": title, "text": body},
+            )
+        elif kind == "notion":
+            # Un bloc par production : Notion plafonne un paragraphe à 2000 caractères.
+            children = [
+                {"object": "block", "type": "paragraph",
+                 "paragraph": {"rich_text": [{"type": "text", "text": {"content": chunk[:2000]}}]}}
+                for a in artifacts
+                for chunk in (f"{a['title']} — {a['body']}",)
+            ] or [{"object": "block", "type": "paragraph",
+                   "paragraph": {"rich_text": [{"type": "text", "text": {"content": "(aucune production)"}}]}}]
+            r = _request(
+                "POST", "https://api.notion.com/v1/pages",
+                headers={"Authorization": f"Bearer {secret}", "Notion-Version": "2022-06-28"},
+                json_body={
+                    "parent": {"page_id": str(config.get("parent_page_id", ""))},
+                    "properties": {"title": [{"type": "text", "text": {"content": title[:200]}}]},
+                    "children": children[:90],
+                },
+            )
+        elif kind == "github":
+            import base64 as _b64
+
+            folder = str(config.get("path", "") or "productions").strip("/")
+            path = f"{folder}/{str(cycle['id'])[:8]}.md"
+            payload = {
+                "message": f"Agent Studio — {title}"[:200],
+                "content": _b64.b64encode(f"# {title}\n\n{body}".encode()).decode(),
+            }
+            if str(config.get("branch", "")).strip():
+                payload["branch"] = str(config["branch"]).strip()
+            r = _request(
+                "PUT", f"https://api.github.com/repos/{config.get('repo', '')}/contents/{path}",
+                headers={"Authorization": f"Bearer {secret}",
+                         "Accept": "application/vnd.github+json"},
+                json_body=payload,
+            )
+        elif kind == "vercel":
+            r = _request("POST", str(config.get("deploy_hook_url", "")), json_body={})
+        elif kind in ("openai", "anthropic", "elevenlabs"):
+            return False, "Cette connexion sert à produire du contenu, pas à publier."
+        else:
+            return False, f"Type de connexion inconnu : « {kind} »."
+    except Exception as exc:
+        return False, f"Échec : {str(exc)[:200]}"
+
+    if r.status_code < 300:
+        return True, f"Envoyé (HTTP {r.status_code})."
+    return False, f"Refusé : HTTP {r.status_code}. {r.text[:160]}"
+
+
+# --------------------------------------------------------------------------
 # Modèles d'entrée
 # --------------------------------------------------------------------------
 
@@ -219,10 +583,21 @@ class ControlIn(BaseModel):
 class DecisionIn(BaseModel):
     status: str
     response: str = ""
+    # Connexions retenues par l'humain au moment d'autoriser. Absente, aucune
+    # n'est mobilisée : une approbation ne déclenche rien par défaut.
+    connectors: list[str] = []
 
 
 class MemoryIn(BaseModel):
     content: str
+
+
+class ConnectorIn(BaseModel):
+    kind: str
+    name: str
+    config: dict = {}
+    # Vide sur une mise à jour : le secret déjà enregistré est conservé.
+    secret: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -254,18 +629,24 @@ def log(conn, project_id, cycle_id, *, kind, title, body="", agent=None, depth=0
 
 
 @app.get("/api/state")
-def state():
+def state(me: dict | None = Depends(optional_user)):
     ok, detail = True, "connectée"
+    # Le mode réel n'est plus une propriété du serveur : une connexion OpenAI
+    # personnelle suffit, la variable d'environnement sert de repli.
+    live = bool(OPENAI_API_KEY)
     try:
         with db() as conn:
             q1(conn, "select 1 as ok")
+            if me:
+                live = bool(llm_key_for(conn, me["id"]))
     except Exception as exc:  # pragma: no cover - dépend de l'infra
         ok, detail = False, str(exc)[:200]
     return {
         "db": ok,
         "db_detail": detail,
-        "live": LIVE,
-        "mode": "live" if LIVE else "demo",
+        "live": live,
+        "mode": "live" if live else "demo",
+        "connectors_ready": CONNECTORS_READY,
         # Servie à l'exécution plutôt que figée au build : changer de projet Auth
         # ne demande pas de reconstruire le front.
         "auth": {
@@ -385,6 +766,110 @@ def del_memory(memory_id: str, me: dict = Depends(current_user)):
         owned(conn, "agents", row["agent_id"], me)
         q(conn, "delete from agent_memory where id=%s", memory_id)
     return {"ok": True}
+
+
+# --------------------------------------------------------------------------
+# Routes — connexions externes
+# --------------------------------------------------------------------------
+
+
+@app.get("/api/connectors/kinds")
+def connector_kinds():
+    """Catalogue des types. L'écran est construit à partir de cette réponse."""
+    return {
+        "ready": CONNECTORS_READY,
+        "capabilities": CAPABILITIES,
+        "kinds": [{"kind": k, **v} for k, v in CONNECTOR_KINDS.items()],
+    }
+
+
+@app.get("/api/connectors")
+def list_connectors(me: dict = Depends(current_user)):
+    with db() as conn:
+        rows = q(conn, "select * from connectors where owner_id=%s order by created_at", me["id"])
+        return [public_connector(r) for r in rows]
+
+
+def _check_connector_in(body: ConnectorIn) -> dict:
+    """Valide le type et les champs obligatoires, renvoie la définition du type."""
+    kind = CONNECTOR_KINDS.get(body.kind)
+    if not kind:
+        raise HTTPException(400, f"Type de connexion inconnu : « {body.kind} ».")
+    if not body.name.strip():
+        raise HTTPException(400, "Donnez un nom à cette connexion.")
+    for field in kind["fields"]:
+        if field["required"] and not str(body.config.get(field["key"], "")).strip():
+            raise HTTPException(400, f"Le champ « {field['label']} » est obligatoire.")
+    return kind
+
+
+@app.post("/api/connectors")
+def create_connector(body: ConnectorIn, me: dict = Depends(current_user)):
+    kind = _check_connector_in(body)
+    if kind["secret_required"] and not body.secret.strip():
+        raise HTTPException(400, f"Le champ « {kind['secret_label']} » est obligatoire.")
+    with db() as conn:
+        row = q1(
+            conn,
+            """insert into connectors (owner_id, kind, name, capabilities, config, secret_enc)
+               values (%s,%s,%s,%s,%s,%s) returning *""",
+            me["id"],
+            body.kind,
+            body.name.strip(),
+            kind["capabilities"],
+            json.dumps(body.config),
+            seal(body.secret.strip()),
+        )
+        return public_connector(row)
+
+
+@app.patch("/api/connectors/{connector_id}")
+def update_connector(connector_id: str, body: ConnectorIn, me: dict = Depends(current_user)):
+    kind = _check_connector_in(body)
+    with db() as conn:
+        existing = own_connector(conn, connector_id, me)
+        # Secret vide : on garde celui déjà enregistré plutôt que de l'effacer.
+        secret_enc = seal(body.secret.strip()) if body.secret.strip() else existing["secret_enc"]
+        if kind["secret_required"] and not secret_enc:
+            raise HTTPException(400, f"Le champ « {kind['secret_label']} » est obligatoire.")
+        row = q1(
+            conn,
+            """update connectors
+               set kind=%s, name=%s, capabilities=%s, config=%s, secret_enc=%s,
+                   status='untested', status_detail='', updated_at=now()
+               where id=%s returning *""",
+            body.kind,
+            body.name.strip(),
+            kind["capabilities"],
+            json.dumps(body.config),
+            secret_enc,
+            connector_id,
+        )
+        return public_connector(row)
+
+
+@app.delete("/api/connectors/{connector_id}")
+def delete_connector(connector_id: str, me: dict = Depends(current_user)):
+    with db() as conn:
+        own_connector(conn, connector_id, me)
+        q(conn, "delete from connectors where id=%s", connector_id)
+    return {"ok": True}
+
+
+@app.post("/api/connectors/{connector_id}/test")
+def test_connector(connector_id: str, me: dict = Depends(current_user)):
+    with db() as conn:
+        row = own_connector(conn, connector_id, me)
+        ok, detail = probe_connector(row)
+        q(
+            conn,
+            """update connectors set status=%s, status_detail=%s, last_tested_at=now()
+               where id=%s""",
+            "ok" if ok else "error",
+            detail[:400],
+            connector_id,
+        )
+        return public_connector(q1(conn, "select * from connectors where id=%s", connector_id))
 
 
 # --------------------------------------------------------------------------
@@ -589,6 +1074,48 @@ def stream(project_id: str, after: int = 0, me: dict = Depends(current_user)):
         }
 
 
+def run_publication(conn, decision, cycle, connector_ids: list[str], me: dict) -> None:
+    """Exécute la publication par les connexions laissées cochées.
+
+    L'échec d'une connexion est journalisé et n'interrompt pas le cycle : une
+    diffusion ratée ne doit pas détruire le travail déjà produit. Ce qui a été
+    décoché est dit explicitement, pour que le journal garde trace du choix.
+    """
+    project = q1(conn, "select * from projects where id=%s", decision["project_id"])
+    proposed = {c["id"] for c in (decision["payload"] or {}).get("connectors", [])}
+    chosen = [cid for cid in connector_ids if cid in proposed]
+    artifacts = q(
+        conn,
+        "select agent_name, title, body from artifacts where cycle_id=%s order by created_at",
+        cycle["id"],
+    )
+
+    declined = proposed - set(chosen)
+    if declined:
+        names = [
+            c["name"]
+            for c in (decision["payload"] or {}).get("connectors", [])
+            if c["id"] in declined
+        ]
+        log(conn, project["id"], cycle["id"], kind="human", depth=1,
+            title="Connexions écartées à la publication",
+            body="Non mobilisées sur votre décision : " + ", ".join(names) + ".")
+
+    for connector_id in chosen:
+        row = q1(
+            conn,
+            "select * from connectors where id=%s and owner_id=%s",
+            connector_id,
+            me["id"],
+        )
+        if not row:
+            continue
+        ok, detail = publish_through(row, project, cycle, artifacts)
+        log(conn, project["id"], cycle["id"], kind="result" if ok else "system", depth=1,
+            title=("✓ Publié via " if ok else "✗ Échec de publication via ") + row["name"],
+            body=detail, payload={"connector": row["name"], "kind": row["kind"], "ok": ok})
+
+
 @app.post("/api/decisions/{decision_id}/respond")
 def respond(decision_id: str, body: DecisionIn, me: dict = Depends(current_user)):
     with db() as conn:
@@ -613,6 +1140,8 @@ def respond(decision_id: str, body: DecisionIn, me: dict = Depends(current_user)
             body=body.response,
         )
         cycle = q1(conn, "select * from cycles where id=%s", d["cycle_id"])
+        if approved and body.connectors and cycle:
+            run_publication(conn, d, cycle, body.connectors, me)
         if cycle and cycle["status"] == "waiting_human":
             plan = cycle["plan"]
             cursor = cycle["cursor"]
@@ -882,7 +1411,7 @@ def start_cycle(project_id: str, body: CycleIn, me: dict = Depends(current_user)
             "insert into cycles (project_id, brief, status, demo) values (%s,%s,'queued',%s) returning *",
             project_id,
             body.brief,
-            not LIVE,
+            not llm_key_for(conn, me["id"]),
         )
         q(conn, "update projects set state='RUNNING' where id=%s", project_id)
         log(
@@ -895,6 +1424,120 @@ def start_cycle(project_id: str, body: CycleIn, me: dict = Depends(current_user)
         )
         enqueue(conn, project_id, cycle["id"])
         return cycle
+
+
+# --------------------------------------------------------------------------
+# Routes — images d'un cycle
+# --------------------------------------------------------------------------
+
+# La limite de corps de requête Vercel est à 4,5 Mo ; on s'arrête avant, et on
+# borne le nombre d'images pour que le coût d'un appel multimodal reste prévisible.
+MAX_IMAGE_BYTES = 3 * 1024 * 1024
+MAX_IMAGES_PER_CYCLE = 8
+
+
+def _image_out(row: dict) -> dict:
+    """Vue sortante : l'URL porte le jeton, seul moyen d'alimenter une balise <img>."""
+    return {
+        "id": str(row["id"]),
+        "filename": row["filename"],
+        "content_type": row["content_type"],
+        "caption": row["caption"],
+        "created_at": row["created_at"],
+        "url": f"/api/images/{row['id']}?t={row['token']}",
+    }
+
+
+def _cycle_for_write(conn, cycle_id: str, me: dict) -> dict:
+    cycle = q1(conn, "select * from cycles where id=%s", cycle_id)
+    if not cycle:
+        raise HTTPException(404, "Cycle introuvable.")
+    owned(conn, "projects", cycle["project_id"], me)
+    return cycle
+
+
+@app.post("/api/cycles/{cycle_id}/images")
+async def add_cycle_image(
+    cycle_id: str,
+    file: UploadFile = File(...),
+    caption: str = Form(""),
+    me: dict = Depends(current_user),
+):
+    if not (file.content_type or "").startswith("image/"):
+        raise HTTPException(400, "Seules des images peuvent être déposées ici.")
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "Le fichier est vide.")
+    if len(data) > MAX_IMAGE_BYTES:
+        raise HTTPException(
+            400,
+            f"Image trop lourde ({len(data) // 1024} Ko) : la limite est de "
+            f"{MAX_IMAGE_BYTES // (1024 * 1024)} Mo.",
+        )
+    with db() as conn:
+        cycle = _cycle_for_write(conn, cycle_id, me)
+        count = q(conn, "select count(*) as n from cycle_images where cycle_id=%s", cycle_id)[0]["n"]
+        if count >= MAX_IMAGES_PER_CYCLE:
+            raise HTTPException(400, f"Ce cycle a déjà {MAX_IMAGES_PER_CYCLE} images.")
+        row = q1(
+            conn,
+            """insert into cycle_images (project_id, cycle_id, filename, content_type, bytes, caption)
+               values (%s,%s,%s,%s,%s,%s) returning *""",
+            cycle["project_id"],
+            cycle_id,
+            (file.filename or "image")[:200],
+            file.content_type,
+            data,
+            caption[:500],
+        )
+        log(conn, cycle["project_id"], cycle_id, kind="human", depth=1,
+            title="Image jointe au cycle",
+            body=caption or (file.filename or "image"))
+        return _image_out(row)
+
+
+@app.get("/api/cycles/{cycle_id}/images")
+def list_cycle_images(cycle_id: str, me: dict = Depends(current_user)):
+    with db() as conn:
+        cycle = q1(conn, "select * from cycles where id=%s", cycle_id)
+        if not cycle:
+            raise HTTPException(404, "Cycle introuvable.")
+        readable(conn, "projects", cycle["project_id"], me)
+        rows = q(
+            conn,
+            """select id, token, filename, content_type, caption, created_at
+               from cycle_images where cycle_id=%s order by created_at""",
+            cycle_id,
+        )
+        return [_image_out(r) for r in rows]
+
+
+@app.get("/api/images/{image_id}")
+def get_image(image_id: str, t: str = ""):
+    """Sert les octets. Une balise <img> ne peut pas porter d'en-tête Authorization :
+    l'accès tient donc au jeton aléatoire de la ligne, non devinable."""
+    from fastapi import Response
+
+    with db() as conn:
+        row = q1(conn, "select * from cycle_images where id=%s", image_id)
+        if not row or not t or str(row["token"]) != t:
+            raise HTTPException(404, "Image introuvable.")
+        return Response(
+            content=bytes(row["bytes"]),
+            media_type=row["content_type"],
+            headers={"Cache-Control": "private, max-age=86400"},
+        )
+
+
+@app.delete("/api/images/{image_id}")
+def delete_image(image_id: str, me: dict = Depends(current_user)):
+    with db() as conn:
+        row = q1(conn, "select project_id from cycle_images where id=%s", image_id)
+        if not row:
+            raise HTTPException(404, "Image introuvable.")
+        owned(conn, "projects", row["project_id"], me)
+        q(conn, "delete from cycle_images where id=%s", image_id)
+    return {"ok": True}
 
 
 @app.post("/api/tick")
@@ -998,6 +1641,12 @@ def run_step(conn, job) -> str:
                 cycle["id"],
             )[0]["n"],
         }
+        # Quelles connexions cette action mobiliserait, et ce qui reste découvert.
+        # Résolues chez le propriétaire du projet : le cycle avance aussi depuis
+        # le cron, où l'appelant n'est pas forcément lui.
+        required = step.get("required_capabilities", [])
+        involved = connectors_covering(conn, project["owner_id"], required)
+        covered = {c for row in involved for c in (row["capabilities"] or [])}
         q(
             conn,
             """insert into decisions (project_id, cycle_id, kind, title, detail, payload)
@@ -1006,7 +1655,16 @@ def run_step(conn, job) -> str:
             cycle["id"],
             step.get("label", "Validation requise"),
             step.get("task", ""),
-            json.dumps({"step": step, "reason": reason}),
+            json.dumps(
+                {
+                    "step": step,
+                    "reason": reason,
+                    "required_capabilities": required,
+                    "connectors": [public_connector(r) for r in involved],
+                    "missing": [c for c in required if c not in covered],
+                },
+                default=str,
+            ),
         )
         q(conn, "update cycles set status='waiting_human' where id=%s", cycle["id"])
         log(conn, project["id"], cycle["id"], kind="gate", agent=agent,
@@ -1022,7 +1680,17 @@ def run_step(conn, job) -> str:
     log(conn, project["id"], cycle["id"], kind="call", agent=agent, depth=1,
         title=f"{agent['name']} · {step.get('label', 'travaille')}", body=step.get("task", ""))
 
-    title, text, data = produce(project, cycle, agent, step, upstream, memory_of(conn, agent["id"]))
+    images = q(
+        conn,
+        """select content_type, bytes, caption from cycle_images
+           where cycle_id=%s order by created_at limit %s""",
+        cycle["id"],
+        MAX_IMAGES_PER_CYCLE,
+    )
+    title, text, data = produce(
+        project, cycle, agent, step, upstream, memory_of(conn, agent["id"]),
+        images=images, api_key=llm_key_for(conn, project["owner_id"]),
+    )
 
     q(
         conn,
@@ -1111,6 +1779,7 @@ def build_plan(conn, project, cycle, team) -> None:
                 "label": "Publication",
                 "kind": "publish",
                 "gate": True,
+                "required_capabilities": PUBLISH_CAPABILITIES,
                 "task": "Publier les contenus retenus. Action irréversible : validation humaine requise.",
                 "why": "La publication est irréversible une fois partie. Le cycle s'arrête ici "
                        "et attend votre accord ; rien n'est publié tant que vous n'avez pas tranché.",
@@ -1129,23 +1798,24 @@ def build_plan(conn, project, cycle, team) -> None:
         payload={"plan": plan})
 
 
-def produce(project, cycle, agent, step, upstream, memory) -> tuple[str, str, dict]:
+def produce(project, cycle, agent, step, upstream, memory, images=None, api_key="") -> tuple[str, str, dict]:
     """Produit la contribution d'un agent, en réel si possible, sinon en démo.
 
     Une clé présente mais un SDK absent ne doit pas faire échouer le cycle : on
     retombe sur le déroulé de démonstration en le disant explicitement.
     """
-    if not LIVE:
-        return produce_demo(project, cycle, agent, step, upstream, memory)
+    images = images or []
+    if not api_key:
+        return produce_demo(project, cycle, agent, step, upstream, memory, images)
     try:
-        return produce_live(project, cycle, agent, step, upstream, memory)
+        return produce_live(project, cycle, agent, step, upstream, memory, images, api_key)
     except ImportError:
-        title, text, data = produce_demo(project, cycle, agent, step, upstream, memory)
+        title, text, data = produce_demo(project, cycle, agent, step, upstream, memory, images)
         data["sdk_missing"] = True
         return title, text + "\n\n(SDK openai-agents absent du déploiement : contenu de démonstration.)", data
 
 
-def _context(project, cycle, step, upstream, memory) -> str:
+def _context(project, cycle, step, upstream, memory, images=None) -> str:
     parts = [
         f"Objectif du projet : {project['objective'] or project['name']}",
         f"Consigne du cycle : {cycle['brief'] or 'appliquer l objectif permanent'}",
@@ -1155,6 +1825,10 @@ def _context(project, cycle, step, upstream, memory) -> str:
         parts.append(f"Instruction humaine prioritaire : {step['directive']}")
     if memory:
         parts.append("Ta mémoire : " + " | ".join(memory))
+    if images:
+        parts.append(f"{len(images)} image(s) jointe(s) à ce cycle, à prendre en compte :")
+        for i, img in enumerate(images, 1):
+            parts.append(f"- image {i} : {img['caption'] or 'sans légende'}")
     if upstream:
         parts.append("Travaux déjà produits dans ce cycle :")
         for u in upstream[-4:]:
@@ -1162,10 +1836,20 @@ def _context(project, cycle, step, upstream, memory) -> str:
     return "\n".join(parts)
 
 
-def produce_live(project, cycle, agent, step, upstream, memory) -> tuple[str, str, dict]:
-    import asyncio
+# Borne de coût : au-delà, un cycle chargé en images ferait exploser la facture
+# d'un seul appel sans rien apporter au raisonnement.
+MAX_IMAGES_PER_CALL = 4
 
-    from agents import Agent, Runner
+
+def produce_live(project, cycle, agent, step, upstream, memory, images=None, api_key="") -> tuple[str, str, dict]:
+    import asyncio
+    import base64
+
+    from agents import Agent, Runner, set_default_openai_key
+
+    # La clé vient du connecteur du propriétaire, ou du serveur : elle est résolue
+    # par cycle, plus au chargement du module.
+    set_default_openai_key(api_key)
 
     sdk_agent = Agent(
         name=agent["name"],
@@ -1173,13 +1857,27 @@ def produce_live(project, cycle, agent, step, upstream, memory) -> tuple[str, st
         + "\n\nRéponds en français, de façon dense et concrète. Pas de préambule.",
         model=agent["model"] or "gpt-4.1-mini",
     )
-    prompt = _context(project, cycle, step, upstream, memory)
+    prompt = _context(project, cycle, step, upstream, memory, images)
     if step.get("kind") == "review":
         prompt += (
             "\n\nTermine impérativement ta réponse par une ligne seule : "
             "VERDICT: accept  ou  VERDICT: revise — suivie, si revise, de ce qu'il faut corriger."
         )
-    result = asyncio.run(Runner.run(sdk_agent, prompt, max_turns=4))
+
+    if images:
+        content: list[dict[str, Any]] = [{"type": "input_text", "text": prompt}]
+        for img in (images or [])[:MAX_IMAGES_PER_CALL]:
+            b64 = base64.b64encode(bytes(img["bytes"])).decode()
+            content.append({
+                "type": "input_image",
+                "detail": "auto",
+                "image_url": f"data:{img['content_type']};base64,{b64}",
+            })
+        model_input: Any = [{"role": "user", "content": content}]
+    else:
+        model_input = prompt
+
+    result = asyncio.run(Runner.run(sdk_agent, model_input, max_turns=4))
     text = str(result.final_output)
     data: dict[str, Any] = {"live": True}
     if step.get("kind") == "review":
@@ -1189,7 +1887,7 @@ def produce_live(project, cycle, agent, step, upstream, memory) -> tuple[str, st
     return f"{agent['name']} — {step.get('label', 'contribution')}", text, data
 
 
-def produce_demo(project, cycle, agent, step, upstream, memory) -> tuple[str, str, dict]:
+def produce_demo(project, cycle, agent, step, upstream, memory, images=None) -> tuple[str, str, dict]:
     """Déroulé de démonstration, sans appel de modèle.
 
     Le parcours, les écritures en base, la boucle de révision et la suspension
@@ -1200,6 +1898,14 @@ def produce_demo(project, cycle, agent, step, upstream, memory) -> tuple[str, st
     directive = step.get("directive", "")
     mem = f"\n\nCe que je retiens de ma mémoire : {memory[0]}" if memory else ""
     head = f"Instruction humaine prise en compte : {directive}\n\n" if directive else ""
+    # Le mode démo n'analyse pas les images, mais il ne doit pas faire comme si
+    # elles n'avaient pas été reçues.
+    if images:
+        legends = ", ".join(i["caption"] or "sans légende" for i in images)
+        head = (
+            f"{len(images)} image(s) reçue(s) ({legends}) — non analysées en mode démo, "
+            "elles le seront dès qu'une clé de modèle sera disponible.\n\n"
+        ) + head
 
     if kind == "analysis":
         body = (

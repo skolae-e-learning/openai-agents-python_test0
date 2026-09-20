@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Agents } from "./Agents";
+import { Connectors } from "./Connectors";
 import { Explore } from "./Explore";
 import { Login } from "./Login";
 import { Projects } from "./Projects";
@@ -11,6 +12,7 @@ type View =
   | { name: "agents" }
   | { name: "projects" }
   | { name: "explore" }
+  | { name: "connectors" }
   | { name: "project"; id: string };
 
 type Status = { db: boolean; db_detail: string; live: boolean; auth: auth.AuthConfig };
@@ -128,6 +130,7 @@ export default function App() {
         ))}
         {nav({ name: "agents" }, "Agents", "◇")}
         {nav({ name: "explore" }, "Explorer", "◎")}
+        {nav({ name: "connectors" }, "Connecteurs", "⇄")}
 
         <div className="side-foot small muted">
           <div className="who lbl-txt" title={me.email}>{me.email}</div>
@@ -177,6 +180,7 @@ export default function App() {
         {view.name === "explore" && (
           <Explore onOpenProject={(id) => setView({ name: "project", id })} onChanged={bump} />
         )}
+        {view.name === "connectors" && <Connectors />}
         {view.name === "project" && (
           <ProjectView id={view.id} live={!!status?.live} onBack={() => setView({ name: "projects" })} />
         )}

@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Canvas } from "./Canvas";
-import { accentOf, api, type Agent, type Artifact, type Cycle, type Decision, type Edge, type Message, type Project, type TeamMember } from "./api";
+import { capLabel } from "./Connectors";
+import { accentOf, api, type Agent, type Artifact, type Connector, type Cycle, type CycleImage, type Decision, type Edge, type Message, type Project, type TeamMember } from "./api";
 
-type Tab = "journal" | "artifacts";
+type Tab = "journal" | "artifacts" | "images";
 
 export function ProjectView({ id, live, onBack }: { id: string; live: boolean; onBack: () => void }) {
   const [project, setProject] = useState<Project | null>(null);
@@ -22,6 +23,13 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
   const [allAgents, setAllAgents] = useState<Agent[]>([]);
   const [collapsed, setCollapsed] = useState<Set<number>>(new Set());
   const [allFolded, setAllFolded] = useState(false);
+  // Connexions écartées, par décision : la carte rend toutes les décisions en attente.
+  const [declined, setDeclined] = useState<Record<string, Set<string>>>({});
+  const [images, setImages] = useState<CycleImage[]>([]);
+  // Images choisies mais pas encore envoyées : au lancement, le cycle n'existe pas encore.
+  const [queued, setQueued] = useState<{ file: File; caption: string }[]>([]);
+  const [uploading, setUploading] = useState(false);
+  const [imageError, setImageError] = useState("");
   const after = useRef(0);
   const scroller = useRef<HTMLDivElement>(null);
   const inbox = useRef<HTMLDivElement>(null);
@@ -66,6 +74,12 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
     if (el && tab === "journal") el.scrollTop = el.scrollHeight;
   }, [messages.length, tab]);
 
+  const cycleId = cycle?.id;
+  useEffect(() => {
+    if (!cycleId) { setImages([]); return; }
+    api.cycleImages(cycleId).then(setImages).catch(() => {});
+  }, [cycleId]);
+
   if (!project) return <div className="body"><div className="empty">Chargement…</div></div>;
 
   const state = project.state;
@@ -87,13 +101,75 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
         ? "Un step a échoué. Le détail exact figure dans le journal, au dernier message système."
         : cycle?.note || "Le cycle a été arrêté. Les contenus déjà produits sont conservés.";
 
+  // Les images déposées avant le lancement attendent l'identifiant du cycle,
+  // qui n'existe qu'une fois celui-ci créé.
+  const uploadTo = async (target: string, items: { file: File; caption: string }[]) => {
+    const sent: CycleImage[] = [];
+    for (const item of items) {
+      try {
+        sent.push(await api.addCycleImage(target, item.file, item.caption));
+      } catch (e: any) {
+        setImageError(`${item.file.name} — ${e?.message || "envoi impossible"}`);
+      }
+    }
+    return sent;
+  };
+
   const start = async () => {
     setStarting(false);
+    setUploading(true);
     after.current = 0; setMessages([]);
-    await api.startCycle(id, brief);
-    setBrief("");
-    reload();
+    try {
+      const created = await api.startCycle(id, brief);
+      if (queued.length) {
+        const sent = await uploadTo(created.id, queued);
+        setImages(sent);
+        setQueued([]);
+      }
+      setBrief("");
+    } finally {
+      setUploading(false);
+      reload();
+    }
   };
+
+  const attachNow = async (files: FileList | null) => {
+    if (!files?.length || !cycle) return;
+    setImageError("");
+    setUploading(true);
+    try {
+      await uploadTo(cycle.id, Array.from(files).map((file) => ({ file, caption: "" })));
+      setImages(await api.cycleImages(cycle.id));
+    } finally {
+      setUploading(false);
+    }
+  };
+
+  const dropImage = async (imageId: string) => {
+    await api.deleteImage(imageId);
+    if (cycle) setImages(await api.cycleImages(cycle.id));
+  };
+
+  // Ce qui reste couvert si l'humain écarte une connexion, et ce qui ne l'est plus.
+  const arbitration = (d: Decision) => {
+    const offered: Connector[] = d.payload?.connectors || [];
+    const off = declined[d.id] || new Set<string>();
+    const kept = offered.filter((c) => !off.has(c.id));
+    const keptCaps = new Set(kept.flatMap((c) => c.capabilities));
+    const lost = offered
+      .filter((c) => off.has(c.id))
+      .flatMap((c) => c.capabilities)
+      .filter((cap) => !keptCaps.has(cap));
+    return { offered, off, kept, lost: Array.from(new Set(lost)) };
+  };
+
+  const toggleConnector = (decisionId: string, connectorId: string) =>
+    setDeclined((prev) => {
+      const next = new Set(prev[decisionId] || []);
+      if (next.has(connectorId)) next.delete(connectorId);
+      else next.add(connectorId);
+      return { ...prev, [decisionId]: next };
+    });
 
   const control = async (action: string, text = "") => { await api.control(id, action, text); reload(); };
 
@@ -195,6 +271,19 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
                   <span className="tag">{artifacts.length} production{artifacts.length > 1 ? "s" : ""} conservée{artifacts.length > 1 ? "s" : ""}</span>
                 </div>
               ) : null}
+              {/* Propre ligne : les connexions en jeu doivent se lire même sans plan. */}
+              {waiting && (pending?.payload?.connectors?.length || pending?.payload?.missing?.length) ? (
+                <div className="meta">
+                  {(pending.payload?.connectors || []).map((c) => (
+                    <span className={"tag " + (declined[pending.id]?.has(c.id) ? "" : "on")} key={c.id}>
+                      {declined[pending.id]?.has(c.id) ? "écarté : " : ""}{c.name}
+                    </span>
+                  ))}
+                  {(pending.payload?.missing || []).map((cap) => (
+                    <span className="tag warn" key={cap}>sans connexion : {capLabel(cap)}</span>
+                  ))}
+                </div>
+              ) : null}
             </div>
             <div className="row">
               {waiting && decisions.length > 0 && (
@@ -256,13 +345,66 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
                     <div className="decision" key={d.id} ref={d.id === decisions[0].id ? inbox : undefined}>
                       <h4>{d.title}</h4>
                       <div className="small" style={{ color: "var(--ink-2)" }}>{d.detail}</div>
-                      {(d.payload as any)?.reason?.why && (
+                      {d.payload?.reason?.why && (
                         <div className="small" style={{ color: "var(--ink-2)", marginTop: 6 }}>
-                          <b>Pourquoi c'est bloqué :</b> {(d.payload as any).reason.why}
+                          <b>Pourquoi c'est bloqué :</b> {d.payload.reason.why}
                         </div>
                       )}
+                      {(() => {
+                        const { offered, off, kept, lost } = arbitration(d);
+                        const missing = d.payload?.missing || [];
+                        if (!offered.length && !missing.length) return null;
+                        return (
+                          <div style={{ marginTop: 10 }}>
+                            {offered.length > 0 && (
+                              <>
+                                <div className="small" style={{ color: "var(--ink-2)", marginBottom: 4 }}>
+                                  <b>Connexions mobilisées si vous autorisez.</b> Décochez celles
+                                  qui ne doivent pas agir.
+                                </div>
+                                {offered.map((c) => (
+                                  <label key={c.id} className="row"
+                                    style={{ padding: "5px 0", cursor: "pointer", alignItems: "flex-start" }}>
+                                    <input type="checkbox" checked={!off.has(c.id)} style={{ marginTop: 3 }}
+                                      onChange={() => toggleConnector(d.id, c.id)} />
+                                    <span style={{ flex: 1, minWidth: 0 }}>
+                                      <b style={{ fontWeight: 600 }}>{c.name}</b>
+                                      <span className="small muted" style={{ display: "block" }}>
+                                        {c.label} · {c.capabilities.map(capLabel).join(", ")}
+                                      </span>
+                                    </span>
+                                    <span className={"tag " + (c.status === "ok" ? "ok" : c.status === "error" ? "stop" : "warn")}>
+                                      {c.status === "ok" ? "connectée" : c.status === "error" ? "en échec" : "à tester"}
+                                    </span>
+                                  </label>
+                                ))}
+                              </>
+                            )}
+                            {lost.map((cap) => {
+                              const alt = kept.find((c) => c.capabilities.includes(cap));
+                              return (
+                                <div className="small" key={cap}
+                                  style={{ color: "var(--ink-2)", marginTop: 4 }}>
+                                  {alt
+                                    ? <>Le volet « {capLabel(cap)} » reste couvert par « {alt.name} ».</>
+                                    : <>Plus aucune connexion ne couvre « {capLabel(cap)} » : cette diffusion sera ignorée.</>}
+                                </div>
+                              );
+                            })}
+                            {missing.length > 0 && (
+                              <div className="small muted" style={{ marginTop: 6 }}>
+                                Sans connexion déclarée : {missing.map(capLabel).join(", ")}. Ces
+                                diffusions ne partiront pas. Ajoutez-les dans l'écran Connecteurs.
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })()}
                       <div className="row" style={{ marginTop: 10 }}>
-                        <button className="btn sm primary" onClick={async () => { await api.respond(d.id, "approved"); reload(); }}>Autoriser</button>
+                        <button className="btn sm primary" onClick={async () => {
+                          await api.respond(d.id, "approved", "", arbitration(d).kept.map((c) => c.id));
+                          reload();
+                        }}>Autoriser</button>
                         <button className="btn sm" onClick={async () => { await api.respond(d.id, "rejected"); reload(); }}>Rejeter</button>
                       </div>
                     </div>
@@ -275,6 +417,7 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
               <div className="card-h" style={{ gap: 4 }}>
                 <button className={"btn sm ghost" + (tab === "journal" ? " " : "")} style={{ color: tab === "journal" ? "var(--accent)" : undefined }} onClick={() => setTab("journal")}>Journal</button>
                 <button className="btn sm ghost" style={{ color: tab === "artifacts" ? "var(--accent)" : undefined }} onClick={() => setTab("artifacts")}>Productions · {artifacts.length}</button>
+                <button className="btn sm ghost" style={{ color: tab === "images" ? "var(--accent)" : undefined }} onClick={() => setTab("images")}>Images · {images.length}</button>
                 <div style={{ flex: 1 }} />
                 {tab === "journal" && messages.length > 0 && (
                   <button className="btn sm ghost" onClick={foldAll}>
@@ -310,6 +453,41 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
                         </div>
                       );
                     })}
+                </div>
+              ) : tab === "images" ? (
+                <div className="journal">
+                  <div className="art" style={{ paddingBottom: 12 }}>
+                    <label className="btn sm" style={{ display: "inline-block" }}>
+                      {uploading ? "Envoi…" : "Joindre une image"}
+                      <input type="file" accept="image/*" multiple hidden disabled={!cycle || uploading}
+                        onChange={(e) => { attachNow(e.target.files); e.target.value = ""; }} />
+                    </label>
+                    <span className="small muted" style={{ marginLeft: 9 }}>
+                      {cycle
+                        ? `3 Mo par image, 8 au maximum. Les agents les reçoivent au step suivant.`
+                        : "Lancez un cycle pour pouvoir y joindre des images."}
+                    </span>
+                    {imageError && (
+                      <div className="banner warn" style={{ marginTop: 9 }}>{imageError}</div>
+                    )}
+                  </div>
+                  {images.length === 0
+                    ? <div className="empty">Aucune image jointe à ce cycle.</div>
+                    : images.map((img) => (
+                      <div className="art" key={img.id}>
+                        <div className="art-meta">
+                          <h4>image</h4>
+                          <span className="who">{img.filename}</span>
+                        </div>
+                        <img className="art-img" src={img.url} alt={img.caption || img.filename} />
+                        {img.caption && <div className="small muted" style={{ marginTop: 6 }}>{img.caption}</div>}
+                        <div className="art-actions">
+                          <button className="btn sm ghost danger" onClick={() => dropImage(img.id)}>
+                            Supprimer
+                          </button>
+                        </div>
+                      </div>
+                    ))}
                 </div>
               ) : (
                 <div className="journal">
@@ -352,13 +530,43 @@ export function ProjectView({ id, live, onBack }: { id: string; live: boolean; o
                   placeholder="Un post qui explique pourquoi l'empilement d'outils ne règle pas le problème."
                   onChange={(e) => setBrief(e.target.value)} />
               </label>
-              <div className="small muted">
+              <label className="f">
+                <span>Images à joindre — les agents les recevront avec la consigne</span>
+                <span className="row">
+                  <label className="btn sm" style={{ display: "inline-block" }}>
+                    Choisir des images
+                    <input type="file" accept="image/*" multiple hidden
+                      onChange={(e) => {
+                        const picked = Array.from(e.target.files || []).map((file) => ({ file, caption: "" }));
+                        setQueued((q) => [...q, ...picked].slice(0, 8));
+                        e.target.value = "";
+                      }} />
+                  </label>
+                  {queued.length > 0 && (
+                    <span className="small muted">{queued.length} image(s) en attente</span>
+                  )}
+                </span>
+              </label>
+              {queued.map((item, i) => (
+                <div className="row small" key={i}
+                  style={{ padding: "4px 0", borderBottom: "1px solid var(--line-soft)" }}>
+                  <span style={{ flex: 1, minWidth: 0 }}>{item.file.name}</span>
+                  <input className="f" style={{ flex: 1, minWidth: 120 }} placeholder="Légende…"
+                    value={item.caption}
+                    onChange={(e) =>
+                      setQueued((q) => q.map((x, j) => (j === i ? { ...x, caption: e.target.value } : x)))} />
+                  <button className="btn sm ghost"
+                    onClick={() => setQueued((q) => q.filter((_, j) => j !== i))}>×</button>
+                </div>
+              ))}
+
+              <div className="small muted" style={{ marginTop: 11 }}>
                 Le chef d'orchestre établira le plan, les spécialistes produiront, le critique évaluera et pourra renvoyer en révision, puis la publication demandera votre validation.
               </div>
             </div>
             <div className="modal-f">
               <button className="btn ghost" onClick={() => setStarting(false)}>Annuler</button>
-              <button className="btn primary" onClick={start}>Lancer</button>
+              <button className="btn primary" disabled={uploading} onClick={start}>Lancer</button>
             </div>
           </div>
         </div>

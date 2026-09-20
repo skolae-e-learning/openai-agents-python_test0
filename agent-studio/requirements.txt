@@ -2,3 +2,10 @@ fastapi
 psycopg[binary]
 openai-agents
 pyjwt[crypto]
+# Chiffrement des secrets de connexion. Arrive aussi via pyjwt[crypto], mais une
+# dépendance transitive est un socle trop fragile pour du chiffrement au repos.
+cryptography
+# Sans lui, FastAPI lève à l'import dès qu'une route déclare UploadFile/File.
+python-multipart
+# Appelé directement pour tester et exécuter les connexions.
+httpx
