@@ -1140,7 +1140,9 @@ def respond(decision_id: str, body: DecisionIn, me: dict = Depends(current_user)
             body=body.response,
         )
         cycle = q1(conn, "select * from cycles where id=%s", d["cycle_id"])
-        if approved and body.connectors and cycle:
+        # Appelée même sans connexion retenue : tout décocher est une décision,
+        # et le journal doit en garder la trace.
+        if approved and cycle:
             run_publication(conn, d, cycle, body.connectors, me)
         if cycle and cycle["status"] == "waiting_human":
             plan = cycle["plan"]
@@ -1373,16 +1375,23 @@ def claim_legacy(me: dict = Depends(current_user)):
 # --------------------------------------------------------------------------
 
 
-def enqueue(conn, project_id, cycle_id):
+def enqueue(conn, project_id, cycle_id, skip_job=None):
     """Planifie le step suivant.
 
     Idempotent : un cycle n'a jamais deux steps en attente. C'est ce qui permet
     de reprendre après une pause sans exécuter deux fois le même step.
+
+    `skip_job` est le job en cours d'exécution. Il est déjà passé à « running »
+    dans cette même transaction, donc sans cette exclusion il se compte lui-même
+    comme travail en attente et le cycle s'arrête après la planification.
     """
     pending = q1(
         conn,
-        "select id from jobs where cycle_id=%s and status in ('queued','running') limit 1",
+        """select id from jobs where cycle_id=%s and status in ('queued','running')
+           and (%s::bigint is null or id <> %s::bigint) limit 1""",
         cycle_id,
+        skip_job,
+        skip_job,
     )
     if pending:
         return
@@ -1602,7 +1611,7 @@ def run_step(conn, job) -> str:
     team = team_of(conn, job["project_id"])
     if cycle["status"] == "queued":
         build_plan(conn, project, cycle, team)
-        enqueue(conn, project["id"], cycle["id"])
+        enqueue(conn, project["id"], cycle["id"], skip_job=job["id"])
         return "planned"
     if cycle["status"] != "running":
         return "idle"
@@ -1620,7 +1629,7 @@ def run_step(conn, job) -> str:
     agent = next((a for a in team if str(a["id"]) == step["agent_id"]), None)
     if agent is None:
         q(conn, "update cycles set cursor=%s where id=%s", cursor + 1, cycle["id"])
-        enqueue(conn, project["id"], cycle["id"])
+        enqueue(conn, project["id"], cycle["id"], skip_job=job["id"])
         return "skipped"
 
     if step.get("gate"):
@@ -1730,7 +1739,7 @@ def run_step(conn, job) -> str:
 
     q(conn, "update cycles set cursor=%s, step_count=step_count+1 where id=%s", next_cursor, cycle["id"])
     if next_cursor < len(plan):
-        enqueue(conn, project["id"], cycle["id"])
+        enqueue(conn, project["id"], cycle["id"], skip_job=job["id"])
     else:
         q(conn, "update cycles set status='done', ended_at=now() where id=%s", cycle["id"])
         q(conn, "update projects set state='IDLE' where id=%s", project["id"])
