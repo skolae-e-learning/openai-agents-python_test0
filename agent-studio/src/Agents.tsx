@@ -12,7 +12,11 @@ const ROLES: [string, string, string][] = [
   ["critic", "Critique", "Évalue la production et peut la renvoyer en révision."],
 ];
 
-export function Agents({ onChanged }: { onChanged: () => void }) {
+// Persiste hors du cycle de vie React : la vue est remontée (clé `nonce`) après
+// chaque sauvegarde, et ne doit pas rouvrir la création pour autant.
+let consumedAutoOpen = 0;
+
+export function Agents({ onChanged, autoOpenCreate }: { onChanged: () => void; autoOpenCreate?: number }) {
   const [agents, setAgents] = useState<Agent[]>([]);
   const [draft, setDraft] = useState<Partial<Agent> | null>(null);
   const [memory, setMemory] = useState<{ id: string; content: string }[]>([]);
@@ -21,6 +25,16 @@ export function Agents({ onChanged }: { onChanged: () => void }) {
 
   const load = () => api.agents().then(setAgents);
   useEffect(() => { load(); }, []);
+
+  // Arrivée depuis un raccourci « Nouvel agent » ailleurs dans l'app : on ouvre
+  // directement le formulaire de création, sans attendre un clic supplémentaire.
+  useEffect(() => {
+    if (autoOpenCreate && autoOpenCreate !== consumedAutoOpen) {
+      consumedAutoOpen = autoOpenCreate;
+      setDraft({ ...BLANK }); setNote(""); setMemory([]);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoOpenCreate]);
 
   const open = async (a?: Agent) => {
     setDraft(a ? { ...a } : { ...BLANK });

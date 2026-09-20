@@ -80,7 +80,10 @@ button, input, textarea, select { font: inherit; color: inherit; }
 .head .spacer { flex: 1; }
 .body { padding: 22px 26px 60px; overflow: auto; flex: 1; }
 .cols { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 420px); gap: 18px; align-items: start; }
-@media (max-width: 1080px) { .cols { grid-template-columns: 1fr; } .side { width: 68px; } .brand b, .brand span, .navbtn span:last-child, .lbl-txt { display: none; } }
+@media (max-width: 1080px) { .cols { grid-template-columns: 1fr; } }
+/* En dessous de 1080px seule la colonne de contenu se replie : la barre latérale
+   garde son libellé « Agents » visible, c'est le seul chemin pour en créer un. */
+@media (max-width: 560px) { .side { width: 68px; } .brand b, .brand span, .navbtn span:last-child, .lbl-txt { display: none; } }
 
 /* ---------- éléments ---------- */
 .card {

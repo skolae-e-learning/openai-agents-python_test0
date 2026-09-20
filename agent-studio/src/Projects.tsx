@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { accentOf, api, type Agent, type Project } from "./api";
 
-export function Projects({ onOpen }: { onOpen: (id: string) => void }) {
+export function Projects({ onOpen, onCreateAgent }: { onOpen: (id: string) => void; onCreateAgent: () => void }) {
   const [projects, setProjects] = useState<Project[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
   const [creating, setCreating] = useState(false);
@@ -59,13 +59,19 @@ export function Projects({ onOpen }: { onOpen: (id: string) => void }) {
           <p>Un projet réunit des agents autour d'un objectif et définit l'architecture qui dit lequel parle à lequel.</p>
         </div>
         <div className="spacer" />
+        <button className="btn" onClick={onCreateAgent}>+ Nouvel agent</button>
         <button className="btn primary" disabled={agents.length === 0} onClick={start}>Nouveau projet</button>
       </div>
 
       <div className="body">
         {projects.length === 0 ? (
           <div className="card"><div className="empty">
-            {agents.length === 0 ? "Créez d'abord des agents." : "Aucun projet. Créez-en un et choisissez son équipe."}
+            {agents.length === 0 ? (
+              <>
+                Aucun agent pour l'instant.{" "}
+                <button className="btn sm primary" onClick={onCreateAgent}>Créer mon premier agent</button>
+              </>
+            ) : "Aucun projet. Créez-en un et choisissez son équipe."}
           </div></div>
         ) : (
           <div className="grid">

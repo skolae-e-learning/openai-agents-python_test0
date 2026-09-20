@@ -11,6 +11,9 @@ export default function App() {
   const [status, setStatus] = useState<{ db: boolean; db_detail: string; live: boolean } | null>(null);
   const [seeding, setSeeding] = useState(false);
   const [nonce, setNonce] = useState(0);
+  const [agentBoot, setAgentBoot] = useState(0);
+
+  const goCreateAgent = () => { setView({ name: "agents" }); setAgentBoot((n) => n + 1); };
 
   useEffect(() => { api.state().then(setStatus).catch(() => setStatus({ db: false, db_detail: "API injoignable", live: false })); }, []);
 
@@ -61,8 +64,12 @@ export default function App() {
 
       <main className="main" key={nonce}>
         {status && !status.db && <Setup detail={status.db_detail} />}
-        {status?.db && view.name === "agents" && <Agents onChanged={() => setNonce((n) => n + 1)} />}
-        {status?.db && view.name === "projects" && <Projects onOpen={(id) => setView({ name: "project", id })} />}
+        {status?.db && view.name === "agents" && (
+          <Agents onChanged={() => setNonce((n) => n + 1)} autoOpenCreate={agentBoot} />
+        )}
+        {status?.db && view.name === "projects" && (
+          <Projects onOpen={(id) => setView({ name: "project", id })} onCreateAgent={goCreateAgent} />
+        )}
         {status?.db && view.name === "project" && (
           <ProjectView id={view.id} live={!!status?.live} onBack={() => setView({ name: "projects" })} />
         )}
